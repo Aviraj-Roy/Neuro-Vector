@@ -1,0 +1,4 @@
+from app.config import MONGO_URI, OCR_CONFIDENCE_THRESHOLD
+
+print(MONGO_URI)
+print(OCR_CONFIDENCE_THRESHOLD)
