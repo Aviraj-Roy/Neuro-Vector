@@ -1,0 +1,50 @@
+medical-bill-verification-ai/
+├── app/
+│   ├── main.py
+│   ├── config.py ✅
+│
+│   ├── ingestion/
+│   │   ├── pdf_loader.py ✅
+│
+│   ├── ocr/
+│   │   └── paddle_engine.py ✅ 
+│   │   └── image_preprocessor.py ✅
+│   │   └── batch_preprocessor.py ✅
+│
+│   ├── classification/
+│   │   └── item_classifier.py ✅
+│
+│   ├── extracttion/
+│   │   ├── bill_extractor.py ✅
+│   │   ├── column_parser.py ✅
+│   │   ├── numeric_guards.py ✅
+│   │   ├── regex_utils.py ✅
+│   │   ├── section_tracker.py ✅
+│   │   └── zone_detector.py ✅
+│
+│   ├── db/
+│   │   ├── mongo_client.py ✅
+│   │   ├── init_indexes.py ✅
+│   │   ├── bill_schema.py ✅
+│   │   └── tieup_rates_schema.py
+│
+│   ├── rules/
+│   │   └── rate_comparator.py
+│
+│   ├── llm/
+│   │   ├── semantic_matcher.py
+│   │   └── judgement_engine.py
+│
+│   ├── reporting/
+│   │   └── verdict_builder.py
+│
+│   └── utils/
+│       ├── file_utils.py ✅
+│       └── logger.py
+│
+├── data/
+│   └── iocl_tieup_rates.json
+│
+├── requirements.txt
+├── README.md
+└── SETUP.md
