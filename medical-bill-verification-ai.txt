@@ -40,6 +40,7 @@ medical-bill-verification-ai/
 │
 │   └── utils/
 │       ├── file_utils.py ✅
+│       ├── cleanup.py ✅
 │       └── logger.py
 │
 ├── data/

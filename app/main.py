@@ -15,6 +15,7 @@ from app.extraction.numeric_guards import (
 from app.ingestion.pdf_loader import pdf_to_images
 from app.ocr.image_preprocessor import preprocess_image
 from app.ocr.paddle_engine import run_ocr
+from app.utils.cleanup import cleanup_images, should_cleanup
 
 logger = logging.getLogger(__name__)
 
@@ -106,17 +107,19 @@ def validate_extraction(bill_data: Dict[str, Any]) -> List[str]:
 # =============================================================================
 # Main Processing Pipeline
 # =============================================================================
-def process_bill(pdf_path: str, upload_id: str | None = None) -> str:
+def process_bill(pdf_path: str, upload_id: str | None = None, auto_cleanup: bool = True) -> str:
     """Process a medical bill PDF and persist ONE MongoDB document.
 
     Business rules enforced:
     - One PDF upload == one MongoDB document, even if multiple pages/bill numbers.
     - Payments are NOT medical services.
     - No hardcoded hospital/test names.
+    - Temporary images are cleaned up after successful OCR + DB save.
 
     Args:
         pdf_path: Path to the PDF file
         upload_id: Optional stable upload ID (generated if not provided)
+        auto_cleanup: Whether to automatically cleanup images after success (default: True)
 
     Returns:
         The upload_id used for storage
@@ -125,52 +128,84 @@ def process_bill(pdf_path: str, upload_id: str | None = None) -> str:
         ExtractionValidationError: If critical validation fails
     """
     upload_id = upload_id or uuid.uuid4().hex
+    
+    # Track pipeline success for cleanup decision
+    ocr_success = False
+    db_success = False
 
-    # 1) Convert ALL pages to images
-    image_paths = pdf_to_images(pdf_path)
-    logger.info(f"Converted {len(image_paths)} pages from {pdf_path}")
+    try:
+        # 1) Convert ALL pages to images
+        image_paths = pdf_to_images(pdf_path)
+        logger.info(f"Converted {len(image_paths)} pages from {pdf_path}")
 
-    # 2) Preprocess ALL images
-    processed_paths = [preprocess_image(p) for p in image_paths]
+        # 2) Preprocess ALL images
+        processed_paths = [preprocess_image(p) for p in image_paths]
 
-    # 3) OCR ALL pages together (page-aware)
-    ocr_result = run_ocr(processed_paths)
-    logger.info(f"OCR completed: {len(ocr_result.get('lines', []))} lines extracted")
+        # 3) OCR ALL pages together (page-aware)
+        ocr_result = run_ocr(processed_paths)
+        logger.info(f"OCR completed: {len(ocr_result.get('lines', []))} lines extracted")
+        ocr_success = True  # OCR completed successfully
 
-    # 4) Extract bill-scoped structured data (three-stage pipeline)
-    #    This returns fully aggregated data across ALL pages
-    bill_data = extract_bill_data(ocr_result)
+        # 4) Extract bill-scoped structured data (three-stage pipeline)
+        #    This returns fully aggregated data across ALL pages
+        bill_data = extract_bill_data(ocr_result)
 
-    # 5) Add immutable metadata BEFORE validation
-    #    (so validation sees the complete final state)
-    bill_data["upload_id"] = upload_id
-    bill_data["source_pdf"] = os.path.basename(pdf_path)
-    bill_data["page_count"] = len(image_paths)
-    bill_data.setdefault("schema_version", 1)
+        # 5) Add immutable metadata BEFORE validation
+        #    (so validation sees the complete final state)
+        bill_data["upload_id"] = upload_id
+        bill_data["source_pdf"] = os.path.basename(pdf_path)
+        bill_data["page_count"] = len(image_paths)
+        bill_data.setdefault("schema_version", 1)
 
-    # 6) Post-extraction validation on FINAL aggregated object
-    #    This runs exactly ONCE per upload_id after full aggregation
-    warnings = validate_extraction(bill_data)
-    for w in warnings:
-        logger.warning(f"Extraction warning: {w}")
-    # Also log structured extraction warnings collected during pipeline
-    for w in bill_data.get("extraction_warnings", []):
-        logger.warning(f"Extraction warning [{w.get('code')}]: {w.get('message')} :: {w.get('context')}")
+        # 6) Post-extraction validation on FINAL aggregated object
+        #    This runs exactly ONCE per upload_id after full aggregation
+        warnings = validate_extraction(bill_data)
+        for w in warnings:
+            logger.warning(f"Extraction warning: {w}")
+        # Also log structured extraction warnings collected during pipeline
+        for w in bill_data.get("extraction_warnings", []):
+            logger.warning(f"Extraction warning [{w.get('code')}]: {w.get('message')} :: {w.get('context')}")
 
-    # 7) Log extraction summary
-    total_items = sum(len(v) for v in bill_data.get("items", {}).values())
-    total_payments = len(bill_data.get("payments", []))
-    logger.info(
-        f"Extraction complete: {total_items} items, {total_payments} payments, "
-        f"grand_total={bill_data.get('grand_total', 0)}"
-    )
+        # 7) Log extraction summary
+        total_items = sum(len(v) for v in bill_data.get("items", {}).values())
+        total_payments = len(bill_data.get("payments", []))
+        logger.info(
+            f"Extraction complete: {total_items} items, {total_payments} payments, "
+            f"grand_total={bill_data.get('grand_total', 0)}"
+        )
 
-    # 8) Single bill-scoped upsert
-    db = MongoDBClient(validate_schema=False)
-    db.upsert_bill(upload_id, bill_data)
-    logger.info(f"Stored bill with upload_id: {upload_id}")
+        # 8) Single bill-scoped upsert
+        db = MongoDBClient(validate_schema=False)
+        db.upsert_bill(upload_id, bill_data)
+        logger.info(f"Stored bill with upload_id: {upload_id}")
+        db_success = True  # DB save completed successfully
 
-    return upload_id
+        return upload_id
+    
+    finally:
+        # 9) Post-processing cleanup (runs even if exceptions occurred)
+        #    Only cleans up if both OCR and DB save succeeded
+        if auto_cleanup:
+            should_run, reason = should_cleanup(ocr_success, db_success)
+            
+            if should_run:
+                try:
+                    # Clean up both uploads/ and uploads/processed/ directories
+                    deleted, failed, failed_paths = cleanup_images("uploads", "uploads/processed")
+                    
+                    if failed > 0:
+                        logger.warning(
+                            f"Post-OCR cleanup completed with {failed} errors. "
+                            f"Successfully deleted {deleted} files. "
+                            f"Failed paths: {failed_paths}"
+                        )
+                    else:
+                        logger.info(f"Post-OCR cleanup successful: {deleted} image files deleted")
+                except Exception as e:
+                    # Never let cleanup failures crash the pipeline
+                    logger.error(f"Post-OCR cleanup failed: {type(e).__name__}: {e}", exc_info=True)
+            else:
+                logger.info(f"Post-OCR cleanup skipped: {reason}")
 
 
 if __name__ == "__main__":
