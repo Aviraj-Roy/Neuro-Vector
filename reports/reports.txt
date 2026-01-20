@@ -1,5 +1,5 @@
 1. 1 report for the ocr engines & why choosing paddleocr initially ✅
-2. 1 report for why paddleocr fails & switching to another ocr
-3. 1 report for why not using qwen, intern, mini-intern, mini-cpm
+2. 1 report for why paddleocr fails & switching to another ocr ❌
+3. 1 report for why not using qwen, intern, mini-intern, mini-cpm ✅
 4. 1 report for how to tackle multi-line medicines text extracted thrgh paddleocr
 5. handling the multiple inputs into one object id & issues like overwritting
