@@ -6,19 +6,27 @@ Matching logic:
 - Hospital: Pick highest similarity match from all tie-up rate sheets
 - Category: Match if similarity >= 0.70, else mark all items as MISMATCH
 - Item: Match if similarity >= 0.85, else mark as MISMATCH
+
+Graceful Degradation:
+- If embedding service fails, indexing is skipped with a warning
+- Queries return empty/no-match results instead of crashing
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import faiss
 import numpy as np
 
-from app.verifier.embedding_service import EmbeddingService, get_embedding_service
+from app.verifier.embedding_service import (
+    EmbeddingService, 
+    EmbeddingServiceUnavailable,
+    get_embedding_service,
+)
 from app.verifier.models import TieUpCategory, TieUpItem, TieUpRateSheet
 
 logger = logging.getLogger(__name__)
@@ -43,11 +51,17 @@ class MatchResult:
     matched_text: Optional[str]
     similarity: float
     index: int  # Index in the original list (-1 if no match)
+    error: Optional[str] = None  # Error message if matching failed
     
     @property
     def is_match(self) -> bool:
         """Check if this is a valid match (index >= 0)."""
-        return self.index >= 0
+        return self.index >= 0 and self.error is None
+    
+    @property
+    def has_error(self) -> bool:
+        """Check if there was an error during matching."""
+        return self.error is not None
 
 
 @dataclass
@@ -175,6 +189,11 @@ class SemanticMatcher:
     """
     Main semantic matcher class.
     Builds FAISS indices from tie-up rate sheets and performs matching.
+    
+    Graceful Degradation:
+    - If embedding service fails during indexing, skips with warning
+    - If embedding service fails during query, returns error result
+    - Never crashes the application
     """
     
     def __init__(self, embedding_service: Optional[EmbeddingService] = None):
@@ -199,9 +218,23 @@ class SemanticMatcher:
         self._item_indices: Dict[Tuple[str, str], FAISSIndex] = {}
         self._item_refs: Dict[Tuple[str, str], List[TieUpItem]] = {}
         
+        # Track indexing status
+        self._indexing_error: Optional[str] = None
+        self._indexed = False
+        
         logger.info("SemanticMatcher initialized")
     
-    def index_rate_sheets(self, rate_sheets: List[TieUpRateSheet]):
+    @property
+    def is_indexed(self) -> bool:
+        """Check if rate sheets have been indexed successfully."""
+        return self._indexed and self._indexing_error is None
+    
+    @property
+    def indexing_error(self) -> Optional[str]:
+        """Get indexing error message if any."""
+        return self._indexing_error
+    
+    def index_rate_sheets(self, rate_sheets: List[TieUpRateSheet]) -> bool:
         """
         Build FAISS indices from tie-up rate sheets.
         
@@ -210,57 +243,103 @@ class SemanticMatcher:
         2. Category indices for each hospital
         3. Item indices for each category in each hospital
         
+        Graceful Degradation:
+        - If embedding service fails, logs warning and returns False
+        - Partial indexing is allowed (some categories may be indexed)
+        
         Args:
             rate_sheets: List of TieUpRateSheet objects
+            
+        Returns:
+            True if indexing succeeded, False if it failed
         """
         if not rate_sheets:
             logger.warning("No rate sheets provided for indexing")
-            return
+            return False
         
         logger.info(f"Indexing {len(rate_sheets)} rate sheets...")
         
         self._hospital_rate_sheets = rate_sheets
+        self._indexing_error = None
         
-        # 1. Index hospital names
-        hospital_names = [rs.hospital_name for rs in rate_sheets]
-        hospital_embeddings = self.embedding_service.get_embeddings(hospital_names)
-        
-        self._hospital_index = FAISSIndex(self.dimension)
-        self._hospital_index.add(hospital_embeddings, hospital_names)
-        
-        # 2. Index categories and items for each hospital
-        for rs in rate_sheets:
-            hospital_key = rs.hospital_name.lower()
+        try:
+            # 1. Index hospital names
+            hospital_names = [rs.hospital_name for rs in rate_sheets]
+            hospital_embeddings, error = self.embedding_service.get_embeddings_safe(hospital_names)
             
-            # Category index for this hospital
-            if rs.categories:
-                category_names = [cat.category_name for cat in rs.categories]
-                category_embeddings = self.embedding_service.get_embeddings(category_names)
+            if error or hospital_embeddings is None:
+                self._indexing_error = f"Failed to embed hospital names: {error}"
+                logger.error(self._indexing_error)
+                return False
+            
+            self._hospital_index = FAISSIndex(self.dimension)
+            self._hospital_index.add(hospital_embeddings, hospital_names)
+            
+            # 2. Index categories and items for each hospital
+            categories_indexed = 0
+            items_indexed = 0
+            
+            for rs in rate_sheets:
+                hospital_key = rs.hospital_name.lower()
                 
-                cat_index = FAISSIndex(self.dimension)
-                cat_index.add(category_embeddings, category_names)
-                
-                self._category_indices[hospital_key] = cat_index
-                self._category_refs[hospital_key] = rs.categories
-                
-                # Item index for each category
-                for cat in rs.categories:
-                    if cat.items:
-                        cat_key = (hospital_key, cat.category_name.lower())
-                        item_names = [item.item_name for item in cat.items]
-                        item_embeddings = self.embedding_service.get_embeddings(item_names)
-                        
-                        item_index = FAISSIndex(self.dimension)
-                        item_index.add(item_embeddings, item_names)
-                        
-                        self._item_indices[cat_key] = item_index
-                        self._item_refs[cat_key] = cat.items
-        
-        logger.info(
-            f"Indexed: {self._hospital_index.size} hospitals, "
-            f"{len(self._category_indices)} category indices, "
-            f"{len(self._item_indices)} item indices"
-        )
+                # Category index for this hospital
+                if rs.categories:
+                    category_names = [cat.category_name for cat in rs.categories]
+                    category_embeddings, error = self.embedding_service.get_embeddings_safe(category_names)
+                    
+                    if error or category_embeddings is None:
+                        logger.warning(
+                            f"Skipping category indexing for {rs.hospital_name}: {error}"
+                        )
+                        continue
+                    
+                    cat_index = FAISSIndex(self.dimension)
+                    cat_index.add(category_embeddings, category_names)
+                    
+                    self._category_indices[hospital_key] = cat_index
+                    self._category_refs[hospital_key] = rs.categories
+                    categories_indexed += 1
+                    
+                    # Item index for each category
+                    for cat in rs.categories:
+                        if cat.items:
+                            cat_key = (hospital_key, cat.category_name.lower())
+                            item_names = [item.item_name for item in cat.items]
+                            item_embeddings, error = self.embedding_service.get_embeddings_safe(item_names)
+                            
+                            if error or item_embeddings is None:
+                                logger.warning(
+                                    f"Skipping item indexing for {rs.hospital_name}/{cat.category_name}: {error}"
+                                )
+                                continue
+                            
+                            item_index = FAISSIndex(self.dimension)
+                            item_index.add(item_embeddings, item_names)
+                            
+                            self._item_indices[cat_key] = item_index
+                            self._item_refs[cat_key] = cat.items
+                            items_indexed += 1
+            
+            self._indexed = True
+            logger.info(
+                f"Indexed: {self._hospital_index.size} hospitals, "
+                f"{categories_indexed} category indices, "
+                f"{items_indexed} item indices"
+            )
+            
+            # Save cache after indexing
+            self.embedding_service.save_cache()
+            
+            return True
+            
+        except EmbeddingServiceUnavailable as e:
+            self._indexing_error = f"Embedding service unavailable: {e}"
+            logger.error(self._indexing_error)
+            return False
+        except Exception as e:
+            self._indexing_error = f"Unexpected indexing error: {e}"
+            logger.error(self._indexing_error, exc_info=True)
+            return False
     
     def match_hospital(self, hospital_name: str) -> HospitalMatch:
         """
@@ -271,18 +350,49 @@ class SemanticMatcher:
             
         Returns:
             HospitalMatch with the best matching rate sheet
+            If embedding fails, returns error result (never crashes)
         """
+        # Check if indexing failed
+        if self._indexing_error:
+            return HospitalMatch(
+                matched_text=None,
+                similarity=0.0,
+                index=-1,
+                rate_sheet=None,
+                error=f"Indexing failed: {self._indexing_error}"
+            )
+        
         if self._hospital_index is None or self._hospital_index.size == 0:
             logger.warning("No hospital index available")
             return HospitalMatch(
                 matched_text=None,
                 similarity=0.0,
                 index=-1,
-                rate_sheet=None
+                rate_sheet=None,
+                error="No hospital index available"
             )
         
-        # Get embedding for query hospital
-        query_embedding = self.embedding_service.get_embedding(hospital_name)
+        # Get embedding for query hospital (with graceful degradation)
+        try:
+            query_embedding = self.embedding_service.get_embedding(hospital_name)
+        except EmbeddingServiceUnavailable as e:
+            logger.warning(f"Embedding service unavailable for hospital match: {e}")
+            return HospitalMatch(
+                matched_text=None,
+                similarity=0.0,
+                index=-1,
+                rate_sheet=None,
+                error=f"Embedding service temporarily unavailable: {e}"
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error getting hospital embedding: {e}")
+            return HospitalMatch(
+                matched_text=None,
+                similarity=0.0,
+                index=-1,
+                rate_sheet=None,
+                error=f"Embedding error: {e}"
+            )
         
         # Find best match
         results = self._hospital_index.search(query_embedding, k=1)
@@ -323,6 +433,7 @@ class SemanticMatcher:
             
         Returns:
             CategoryMatch (similarity < threshold means MISMATCH)
+            If embedding fails, returns error result (never crashes)
         """
         hospital_key = hospital_name.lower()
         
@@ -338,8 +449,27 @@ class SemanticMatcher:
         cat_index = self._category_indices[hospital_key]
         cat_refs = self._category_refs[hospital_key]
         
-        # Get embedding for query category
-        query_embedding = self.embedding_service.get_embedding(category_name)
+        # Get embedding for query category (with graceful degradation)
+        try:
+            query_embedding = self.embedding_service.get_embedding(category_name)
+        except EmbeddingServiceUnavailable as e:
+            logger.warning(f"Embedding service unavailable for category match: {e}")
+            return CategoryMatch(
+                matched_text=None,
+                similarity=0.0,
+                index=-1,
+                category=None,
+                error=f"Embedding service temporarily unavailable: {e}"
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error getting category embedding: {e}")
+            return CategoryMatch(
+                matched_text=None,
+                similarity=0.0,
+                index=-1,
+                category=None,
+                error=f"Embedding error: {e}"
+            )
         
         # Find best match
         results = cat_index.search(query_embedding, k=1)
@@ -383,6 +513,7 @@ class SemanticMatcher:
             
         Returns:
             ItemMatch (similarity < threshold means MISMATCH)
+            If embedding fails, returns error result (never crashes)
         """
         cat_key = (hospital_name.lower(), category_name.lower())
         
@@ -398,8 +529,27 @@ class SemanticMatcher:
         item_index = self._item_indices[cat_key]
         item_refs = self._item_refs[cat_key]
         
-        # Get embedding for query item
-        query_embedding = self.embedding_service.get_embedding(item_name)
+        # Get embedding for query item (with graceful degradation)
+        try:
+            query_embedding = self.embedding_service.get_embedding(item_name)
+        except EmbeddingServiceUnavailable as e:
+            logger.warning(f"Embedding service unavailable for item match: {e}")
+            return ItemMatch(
+                matched_text=None,
+                similarity=0.0,
+                index=-1,
+                item=None,
+                error=f"Embedding service temporarily unavailable: {e}"
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error getting item embedding: {e}")
+            return ItemMatch(
+                matched_text=None,
+                similarity=0.0,
+                index=-1,
+                item=None,
+                error=f"Embedding error: {e}"
+            )
         
         # Find best match
         results = item_index.search(query_embedding, k=1)
