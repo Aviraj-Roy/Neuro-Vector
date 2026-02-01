@@ -1,14 +1,16 @@
 fastapi
 uvicorn
-paddleocr3.3.2
+paddleocr==3.3.2
 paddlepaddle
-pymongo3.12
+pymongo==3.12
 python-multipart
 python-dotenv
 
-# Bill Verifier dependencies
-openai>=1.0.0
+# Bill Verifier dependencies (LOCAL MODELS ONLY)
+sentence-transformers>=2.2.0
 faiss-cpu>=1.7.0
 numpy>=1.24.0
 pydantic>=2.0.0
 pydantic-settings>=2.0.0
+requests>=2.31.0
+torch>=2.0.0

@@ -5,7 +5,10 @@ Uses FAISS for efficient similarity search on embeddings.
 Matching logic:
 - Hospital: Pick highest similarity match from all tie-up rate sheets
 - Category: Match if similarity >= 0.70, else mark all items as MISMATCH
-- Item: Match if similarity >= 0.85, else mark as MISMATCH
+- Item: 
+  * similarity >= 0.85: Auto-match
+  * 0.70 <= similarity < 0.85: Use LLM verification
+  * similarity < 0.70: Auto-reject (MISMATCH)
 
 Graceful Degradation:
 - If embedding service fails, indexing is skipped with a warning
@@ -27,6 +30,7 @@ from app.verifier.embedding_service import (
     EmbeddingServiceUnavailable,
     get_embedding_service,
 )
+from app.verifier.llm_router import LLMRouter, get_llm_router
 from app.verifier.models import TieUpCategory, TieUpItem, TieUpRateSheet
 
 logger = logging.getLogger(__name__)
@@ -196,14 +200,20 @@ class SemanticMatcher:
     - Never crashes the application
     """
     
-    def __init__(self, embedding_service: Optional[EmbeddingService] = None):
+    def __init__(
+        self, 
+        embedding_service: Optional[EmbeddingService] = None,
+        llm_router: Optional[LLMRouter] = None,
+    ):
         """
         Initialize the semantic matcher.
         
         Args:
             embedding_service: Embedding service instance (uses global if None)
+            llm_router: LLM router instance (uses global if None)
         """
         self.embedding_service = embedding_service or get_embedding_service()
+        self.llm_router = llm_router or get_llm_router()
         self.dimension = self.embedding_service.dimension
         
         # Hospital-level index
@@ -222,7 +232,11 @@ class SemanticMatcher:
         self._indexing_error: Optional[str] = None
         self._indexed = False
         
-        logger.info("SemanticMatcher initialized")
+        # Track LLM usage statistics
+        self._llm_calls = 0
+        self._total_matches = 0
+        
+        logger.info("SemanticMatcher initialized with LLM router")
     
     @property
     def is_indexed(self) -> bool:
@@ -500,21 +514,30 @@ class SemanticMatcher:
         item_name: str,
         hospital_name: str,
         category_name: str,
-        threshold: float = ITEM_SIMILARITY_THRESHOLD
+        threshold: float = ITEM_SIMILARITY_THRESHOLD,
+        use_llm: bool = True,
     ) -> ItemMatch:
         """
-        Match a bill item to a tie-up item.
+        Match a bill item to a tie-up item with LLM fallback for borderline cases.
+        
+        Matching Strategy:
+        - similarity >= 0.85: Auto-match (no LLM)
+        - 0.70 <= similarity < 0.85: Use LLM verification (if use_llm=True)
+        - similarity < 0.70: Auto-reject (MISMATCH)
         
         Args:
             item_name: Item name from the bill
             hospital_name: Matched hospital name
             category_name: Matched category name
             threshold: Minimum similarity threshold (default 0.85)
+            use_llm: Whether to use LLM for borderline cases (default True)
             
         Returns:
-            ItemMatch (similarity < threshold means MISMATCH)
+            ItemMatch (similarity < threshold means MISMATCH unless LLM overrides)
             If embedding fails, returns error result (never crashes)
         """
+        self._total_matches += 1
+        
         cat_key = (hospital_name.lower(), category_name.lower())
         
         if cat_key not in self._item_indices:
@@ -567,11 +590,53 @@ class SemanticMatcher:
         
         logger.debug(f"Item match: '{item_name}' -> '{matched_name}' (sim={similarity:.4f})")
         
+        # Auto-match for high similarity
+        if similarity >= threshold:
+            return ItemMatch(
+                matched_text=matched_name,
+                similarity=similarity,
+                index=idx,
+                item=item
+            )
+        
+        # Use LLM for borderline cases (0.70 <= similarity < 0.85)
+        if use_llm and similarity >= CATEGORY_SIMILARITY_THRESHOLD:
+            self._llm_calls += 1
+            logger.info(
+                f"Borderline similarity ({similarity:.4f}), using LLM for verification"
+            )
+            
+            llm_result = self.llm_router.match_with_llm(
+                bill_item=item_name,
+                tieup_item=matched_name,
+                similarity=similarity,
+            )
+            
+            if llm_result.is_valid and llm_result.match:
+                # LLM confirmed match
+                logger.info(
+                    f"LLM confirmed match: '{item_name}' -> '{matched_name}' "
+                    f"(confidence={llm_result.confidence:.4f}, model={llm_result.model_used})"
+                )
+                return ItemMatch(
+                    matched_text=matched_name,
+                    similarity=llm_result.confidence,  # Use LLM confidence
+                    index=idx,
+                    item=item
+                )
+            else:
+                # LLM rejected or failed
+                logger.info(
+                    f"LLM rejected match: '{item_name}' -> '{matched_name}' "
+                    f"(confidence={llm_result.confidence:.4f}, error={llm_result.error})"
+                )
+        
+        # No match (either below threshold or LLM rejected)
         return ItemMatch(
             matched_text=matched_name,
             similarity=similarity,
-            index=idx if similarity >= threshold else -1,
-            item=item if similarity >= threshold else None
+            index=-1,
+            item=None
         )
     
     def clear_indices(self):
@@ -583,6 +648,24 @@ class SemanticMatcher:
         self._item_indices.clear()
         self._item_refs.clear()
         logger.info("All indices cleared")
+    
+    @property
+    def llm_usage_percentage(self) -> float:
+        """Calculate percentage of matches that used LLM."""
+        if self._total_matches == 0:
+            return 0.0
+        return (self._llm_calls / self._total_matches) * 100.0
+    
+    @property
+    def stats(self) -> dict:
+        """Return matching statistics."""
+        return {
+            "total_matches": self._total_matches,
+            "llm_calls": self._llm_calls,
+            "llm_usage_percentage": self.llm_usage_percentage,
+            "llm_cache_size": self.llm_router.cache_size,
+            "llm_cache_hit_rate": self.llm_router.cache_hit_rate,
+        }
 
 
 # =============================================================================

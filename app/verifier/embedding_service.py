@@ -1,26 +1,20 @@
 """
-Embedding Service for the Hospital Bill Verifier.
+Embedding Service for the Hospital Bill Verifier - LOCAL VERSION.
 
 Features:
-- Persistent disk cache (JSON) to avoid redundant API calls
-- Batched requests (max 20 texts per API call)
-- Exponential backoff retry for rate limits (429 errors)
-- Graceful degradation when API unavailable
-- Configurable provider via environment variables
+- Uses sentence-transformers with bge-base-en-v1.5 (fully local)
+- Persistent disk cache (JSON) to avoid redundant computations
+- Batched embedding generation for efficiency
+- No external API calls
+- Model loaded once at startup
 
 Usage:
     service = EmbeddingService()
     embeddings = service.get_embeddings(["text1", "text2"])
 
 Environment Variables:
-    EMBEDDING_PROVIDER: "openai" (default) or other compatible provider
-    EMBEDDING_MODEL: Model name (default: text-embedding-3-small)
-    EMBEDDING_DIMENSION: Vector dimension (default: 1536)
-    EMBEDDING_API_BASE: API endpoint URL
-    OPENAI_API_KEY: API key
+    EMBEDDING_MODEL: Model name (default: bge-base-en-v1.5)
     EMBEDDING_CACHE_PATH: Path to cache file (default: data/embedding_cache.json)
-    EMBEDDING_MAX_BATCH_SIZE: Max texts per API call (default: 20)
-    EMBEDDING_MAX_RETRIES: Max retry attempts (default: 3)
 """
 
 from __future__ import annotations
@@ -28,21 +22,17 @@ from __future__ import annotations
 import atexit
 import logging
 import os
-import time
 from typing import List, Optional, Tuple
 
 import numpy as np
 
-# Import OpenAI with error handling for rate limits
+# Import sentence-transformers for local embeddings
 try:
-    from openai import OpenAI, RateLimitError, APIError, APIConnectionError
-    OPENAI_AVAILABLE = True
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
-    OPENAI_AVAILABLE = False
-    OpenAI = None
-    RateLimitError = Exception
-    APIError = Exception
-    APIConnectionError = Exception
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    SentenceTransformer = None
 
 from app.verifier.embedding_cache import EmbeddingCache, get_embedding_cache
 
@@ -64,78 +54,46 @@ class EmbeddingServiceError(Exception):
 
 
 # =============================================================================
-# Configuration Constants
-# =============================================================================
-
-# Max texts per API batch (OpenAI limit is higher, but 20 is safe)
-DEFAULT_MAX_BATCH_SIZE = 20
-
-# Retry configuration
-DEFAULT_MAX_RETRIES = 3
-DEFAULT_INITIAL_BACKOFF = 1.0  # seconds
-DEFAULT_BACKOFF_MULTIPLIER = 2.0
-DEFAULT_MAX_BACKOFF = 60.0  # seconds
-
-
-# =============================================================================
-# Embedding Service
+# Embedding Service (Local)
 # =============================================================================
 
 class EmbeddingService:
     """
-    Production-ready embedding service with caching, batching, and retry logic.
+    Production-ready local embedding service with caching.
     
     Features:
-    - Persistent disk cache to minimize API calls
-    - Automatic batching (configurable max batch size)
-    - Exponential backoff retry for rate limit errors
-    - Graceful degradation (returns error instead of crashing)
+    - Fully local using sentence-transformers
+    - Persistent disk cache to minimize computation
+    - Automatic batching for efficiency
+    - Model loaded once at startup
     - Thread-safe operations
     """
     
     def __init__(
         self,
-        api_key: Optional[str] = None,
-        api_base: Optional[str] = None,
-        model: Optional[str] = None,
-        dimension: Optional[int] = None,
+        model_name: Optional[str] = None,
         cache: Optional[EmbeddingCache] = None,
-        max_batch_size: Optional[int] = None,
-        max_retries: Optional[int] = None,
+        device: Optional[str] = None,
     ):
         """
-        Initialize the embedding service.
+        Initialize the local embedding service.
         
         Args:
-            api_key: API key (defaults to OPENAI_API_KEY env var)
-            api_base: API base URL (defaults to EMBEDDING_API_BASE env var)
-            model: Embedding model name (defaults to EMBEDDING_MODEL env var)
-            dimension: Embedding dimension (defaults to EMBEDDING_DIMENSION env var)
+            model_name: Model name (defaults to EMBEDDING_MODEL env var)
             cache: EmbeddingCache instance (uses global singleton if None)
-            max_batch_size: Max texts per API call (defaults to EMBEDDING_MAX_BATCH_SIZE)
-            max_retries: Max retry attempts (defaults to EMBEDDING_MAX_RETRIES)
+            device: Device to run model on ('cpu', 'cuda', or None for auto)
         """
         # Configuration from env vars with defaults
-        self.provider = os.getenv("EMBEDDING_PROVIDER", "openai")
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
-        self.api_base = api_base or os.getenv("EMBEDDING_API_BASE", "https://api.openai.com/v1")
-        self.model = model or os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-        self.dimension = dimension or int(os.getenv("EMBEDDING_DIMENSION", "1536"))
-        
-        # Batching and retry config
-        self.max_batch_size = max_batch_size or int(
-            os.getenv("EMBEDDING_MAX_BATCH_SIZE", str(DEFAULT_MAX_BATCH_SIZE))
-        )
-        self.max_retries = max_retries or int(
-            os.getenv("EMBEDDING_MAX_RETRIES", str(DEFAULT_MAX_RETRIES))
-        )
+        self.model_name = model_name or os.getenv("EMBEDDING_MODEL", "bge-base-en-v1.5")
+        self.device = device or os.getenv("EMBEDDING_DEVICE", "cpu")
         
         # Use persistent cache (global singleton by default)
         self._cache = cache or get_embedding_cache()
         
-        # Initialize OpenAI client (lazy, only if available)
-        self._client: Optional[OpenAI] = None
-        self._client_initialized = False
+        # Initialize model (lazy loading)
+        self._model: Optional[SentenceTransformer] = None
+        self._model_initialized = False
+        self._dimension: Optional[int] = None
         
         # Track service availability
         self._available = True
@@ -145,41 +103,51 @@ class EmbeddingService:
         atexit.register(self._save_cache_on_exit)
         
         logger.info(
-            f"EmbeddingService initialized: provider={self.provider}, "
-            f"model={self.model}, dimension={self.dimension}, "
-            f"max_batch={self.max_batch_size}, max_retries={self.max_retries}"
+            f"EmbeddingService initialized: model={self.model_name}, device={self.device}"
         )
     
-    def _get_client(self) -> Optional[OpenAI]:
-        """Lazy-initialize and return the OpenAI client."""
-        if not self._client_initialized:
-            self._client_initialized = True
+    def _get_model(self) -> Optional[SentenceTransformer]:
+        """Lazy-initialize and return the sentence-transformers model."""
+        if not self._model_initialized:
+            self._model_initialized = True
             
-            if not OPENAI_AVAILABLE:
-                logger.error("OpenAI package not installed. Run: pip install openai")
+            if not SENTENCE_TRANSFORMERS_AVAILABLE:
+                logger.error("sentence-transformers package not installed. Run: pip install sentence-transformers")
                 self._available = False
-                self._last_error = "OpenAI package not installed"
-                return None
-            
-            if not self.api_key:
-                logger.error("OPENAI_API_KEY not set")
-                self._available = False
-                self._last_error = "API key not configured"
+                self._last_error = "sentence-transformers package not installed"
                 return None
             
             try:
-                self._client = OpenAI(
-                    api_key=self.api_key,
-                    base_url=self.api_base,
+                logger.info(f"Loading model '{self.model_name}' on device '{self.device}'...")
+                self._model = SentenceTransformer(self.model_name, device=self.device)
+                
+                # Get embedding dimension
+                self._dimension = self._model.get_sentence_embedding_dimension()
+                
+                logger.info(
+                    f"Model loaded successfully: dimension={self._dimension}"
                 )
-                logger.info(f"OpenAI client initialized for {self.api_base}")
+                self._available = True
+                self._last_error = None
+                
             except Exception as e:
-                logger.error(f"Failed to initialize OpenAI client: {e}")
+                logger.error(f"Failed to load model '{self.model_name}': {e}")
                 self._available = False
                 self._last_error = str(e)
                 return None
         
-        return self._client
+        return self._model
+    
+    @property
+    def dimension(self) -> int:
+        """Get embedding dimension."""
+        if self._dimension is None:
+            # Try to initialize model to get dimension
+            model = self._get_model()
+            if model is None:
+                # Default dimension for bge-base-en-v1.5
+                return 768
+        return self._dimension or 768
     
     def _save_cache_on_exit(self):
         """Save cache to disk when service is destroyed."""
@@ -189,93 +157,39 @@ class EmbeddingService:
         except Exception as e:
             logger.warning(f"Failed to save cache on exit: {e}")
     
-    def _call_api_with_retry(
-        self, 
-        texts: List[str]
-    ) -> Tuple[List[np.ndarray], Optional[str]]:
+    def _generate_embeddings(self, texts: List[str]) -> Tuple[Optional[np.ndarray], Optional[str]]:
         """
-        Call embedding API with exponential backoff retry.
+        Generate embeddings using local model.
         
         Args:
-            texts: List of texts to embed (should be <= max_batch_size)
+            texts: List of texts to embed
             
         Returns:
-            Tuple of (embeddings list, error message or None)
+            Tuple of (embeddings array, error message or None)
         """
-        client = self._get_client()
-        if client is None:
-            return [], self._last_error or "Embedding service unavailable"
+        model = self._get_model()
+        if model is None:
+            return None, self._last_error or "Embedding model unavailable"
         
-        backoff = DEFAULT_INITIAL_BACKOFF
-        last_error = None
-        
-        for attempt in range(self.max_retries):
-            try:
-                # Make API call
-                response = client.embeddings.create(
-                    input=texts,
-                    model=self.model,
-                )
-                
-                # Extract embeddings
-                embeddings = [
-                    np.array(item.embedding, dtype=np.float32)
-                    for item in response.data
-                ]
-                
-                # Success - reset availability flag
-                self._available = True
-                self._last_error = None
-                
-                return embeddings, None
-                
-            except RateLimitError as e:
-                # Rate limit (429) - retry with backoff
-                last_error = f"Rate limit exceeded: {e}"
-                logger.warning(
-                    f"Rate limit hit (attempt {attempt + 1}/{self.max_retries}), "
-                    f"retrying in {backoff:.1f}s..."
-                )
-                time.sleep(backoff)
-                backoff = min(backoff * DEFAULT_BACKOFF_MULTIPLIER, DEFAULT_MAX_BACKOFF)
-                
-            except APIConnectionError as e:
-                # Connection error - retry
-                last_error = f"API connection error: {e}"
-                logger.warning(
-                    f"Connection error (attempt {attempt + 1}/{self.max_retries}), "
-                    f"retrying in {backoff:.1f}s..."
-                )
-                time.sleep(backoff)
-                backoff = min(backoff * DEFAULT_BACKOFF_MULTIPLIER, DEFAULT_MAX_BACKOFF)
-                
-            except APIError as e:
-                # API error - check if retryable
-                last_error = f"API error: {e}"
-                if hasattr(e, 'status_code') and e.status_code == 429:
-                    # Quota exceeded - this is the insufficient_quota error
-                    logger.error(
-                        f"API quota exceeded (attempt {attempt + 1}/{self.max_retries}): {e}"
-                    )
-                    time.sleep(backoff)
-                    backoff = min(backoff * DEFAULT_BACKOFF_MULTIPLIER, DEFAULT_MAX_BACKOFF)
-                else:
-                    # Non-retryable error
-                    logger.error(f"API error (non-retryable): {e}")
-                    break
-                    
-            except Exception as e:
-                # Unexpected error - don't retry
-                last_error = f"Unexpected error: {e}"
-                logger.error(f"Unexpected embedding error: {type(e).__name__}: {e}")
-                break
-        
-        # All retries exhausted
-        self._available = False
-        self._last_error = last_error
-        logger.error(f"Embedding API failed after {self.max_retries} attempts: {last_error}")
-        
-        return [], last_error
+        try:
+            # Generate embeddings with normalization
+            embeddings = model.encode(
+                texts,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
+            
+            # Ensure float32 dtype
+            embeddings = embeddings.astype(np.float32)
+            
+            return embeddings, None
+            
+        except Exception as e:
+            error_msg = f"Embedding generation failed: {e}"
+            logger.error(error_msg)
+            self._last_error = error_msg
+            return None, error_msg
     
     def get_embedding(self, text: str) -> np.ndarray:
         """
@@ -296,12 +210,12 @@ class EmbeddingService:
             logger.debug(f"Cache hit for text: {text[:50]}...")
             return cached
         
-        # Call API
-        embeddings, error = self._call_api_with_retry([text])
+        # Generate embedding
+        embeddings, error = self._generate_embeddings([text])
         
-        if error or not embeddings:
+        if error or embeddings is None:
             raise EmbeddingServiceUnavailable(
-                f"Embedding service temporarily unavailable: {error}"
+                f"Embedding service unavailable: {error}"
             )
         
         embedding = embeddings[0]
@@ -313,11 +227,10 @@ class EmbeddingService:
     
     def get_embeddings(self, texts: List[str]) -> np.ndarray:
         """
-        Get embeddings for multiple text strings with batching.
+        Get embeddings for multiple text strings with caching.
         
         - Checks cache first for all texts
-        - Only fetches uncached texts from API
-        - Batches API calls (max_batch_size texts per call)
+        - Only generates embeddings for uncached texts
         - Saves results to persistent cache
         
         Args:
@@ -349,62 +262,39 @@ class EmbeddingService:
         if cache_hits > 0:
             logger.debug(f"Cache: {cache_hits} hits, {cache_misses} misses")
         
-        # Fetch uncached embeddings from API in batches
+        # Generate uncached embeddings
         if texts_to_fetch:
-            # Split into batches
-            batches = []
-            for i in range(0, len(texts_to_fetch), self.max_batch_size):
-                batches.append(texts_to_fetch[i:i + self.max_batch_size])
+            batch_texts = [text for _, text in texts_to_fetch]
+            batch_indices = [idx for idx, _ in texts_to_fetch]
             
-            logger.info(
-                f"Fetching {len(texts_to_fetch)} embeddings in {len(batches)} batch(es)..."
-            )
+            logger.info(f"Generating {len(batch_texts)} embeddings locally...")
             
-            all_errors = []
+            # Generate embeddings
+            embeddings, error = self._generate_embeddings(batch_texts)
             
-            for batch_idx, batch in enumerate(batches):
-                batch_texts = [text for _, text in batch]
-                batch_indices = [idx for idx, _ in batch]
-                
-                # Call API with retry
-                embeddings, error = self._call_api_with_retry(batch_texts)
-                
-                if error:
-                    all_errors.append(error)
-                    logger.warning(
-                        f"Batch {batch_idx + 1}/{len(batches)} failed: {error}"
-                    )
-                    continue
-                
-                # Store results and cache
-                new_cache_items = {}
-                for j, embedding in enumerate(embeddings):
-                    original_idx = batch_indices[j]
-                    text = batch_texts[j]
-                    results.append((original_idx, embedding))
-                    new_cache_items[text] = embedding
-                
-                # Batch save to cache
-                if new_cache_items:
-                    self._cache.set_batch(new_cache_items)
-                
-                logger.debug(
-                    f"Batch {batch_idx + 1}/{len(batches)}: {len(embeddings)} embeddings fetched"
-                )
-            
-            # Check if we got all embeddings
-            if len(results) < len(texts):
-                missing_count = len(texts) - len(results)
-                error_msg = "; ".join(all_errors) if all_errors else "Unknown error"
+            if error or embeddings is None:
                 raise EmbeddingServiceUnavailable(
-                    f"Embedding service temporarily unavailable. "
-                    f"Failed to fetch {missing_count} embeddings: {error_msg}"
+                    f"Embedding service unavailable: {error}"
                 )
+            
+            # Store results and cache
+            new_cache_items = {}
+            for j, embedding in enumerate(embeddings):
+                original_idx = batch_indices[j]
+                text = batch_texts[j]
+                results.append((original_idx, embedding))
+                new_cache_items[text] = embedding
+            
+            # Batch save to cache
+            if new_cache_items:
+                self._cache.set_batch(new_cache_items)
+            
+            logger.debug(f"Generated {len(embeddings)} embeddings")
         
         # Sort by original index and stack into array
         results.sort(key=lambda x: x[0])
         
-        # Auto-save cache periodically (every 100 new embeddings)
+        # Auto-save cache periodically
         if cache_misses > 0 and self._cache.is_dirty:
             self._cache.save()
         
