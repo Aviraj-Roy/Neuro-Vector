@@ -115,13 +115,16 @@ def fetch_bill_from_mongodb(upload_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def transform_mongodb_bill_to_input(doc: Dict[str, Any]) -> BillInput:
+def transform_mongodb_bill_to_input(
+    doc: Dict[str, Any],
+    hospital_name: Optional[str] = None
+) -> BillInput:
     """
     Transform a MongoDB bill document to BillInput format.
     
     The MongoDB document has items grouped by category like:
     {
-        "header": {"hospital_name": "..."},
+        "hospital_name_metadata": "Apollo Hospital",  # NEW: stored at root level
         "items": {
             "medicines": [...],
             "diagnostics_tests": [...],
@@ -135,10 +138,25 @@ def transform_mongodb_bill_to_input(doc: Dict[str, Any]) -> BillInput:
             {"category_name": "medicines", "items": [...]}
         ]
     }
+    
+    Args:
+        doc: MongoDB bill document
+        hospital_name: Optional hospital name override (takes precedence over metadata)
+    
+    Returns:
+        BillInput object for verification
     """
-    # Extract hospital name from header
-    header = doc.get("header", {}) or {}
-    hospital_name = header.get("hospital_name") or "Unknown Hospital"
+    # Extract hospital name from parameter, metadata, or legacy header field
+    if hospital_name:
+        # Explicit parameter takes precedence
+        final_hospital_name = hospital_name
+    elif doc.get("hospital_name_metadata"):
+        # Use metadata field (new schema v2)
+        final_hospital_name = doc.get("hospital_name_metadata")
+    else:
+        # Fallback to legacy header field or default
+        header = doc.get("header", {}) or {}
+        final_hospital_name = header.get("hospital_name") or "Unknown Hospital"
     
     # Transform items dict to categories list
     items_dict = doc.get("items", {}) or {}
@@ -170,7 +188,7 @@ def transform_mongodb_bill_to_input(doc: Dict[str, Any]) -> BillInput:
             })
     
     return BillInput(
-        hospital_name=hospital_name,
+        hospital_name=final_hospital_name,
         categories=categories,
     )
 
@@ -314,12 +332,16 @@ async def list_tieups():
 # Synchronous Helper Functions (for use in non-async contexts)
 # =============================================================================
 
-def verify_bill_from_mongodb_sync(upload_id: str) -> Dict[str, Any]:
+def verify_bill_from_mongodb_sync(
+    upload_id: str,
+    hospital_name: Optional[str] = None
+) -> Dict[str, Any]:
     """
     Synchronous version of verify_bill_from_mongodb for use in main.py.
     
     Args:
         upload_id: The upload_id of the bill to verify
+        hospital_name: Optional hospital name override (uses metadata if not provided)
         
     Returns:
         Verification result as a dictionary
@@ -333,9 +355,9 @@ def verify_bill_from_mongodb_sync(upload_id: str) -> Dict[str, Any]:
     if doc is None:
         raise ValueError(f"Bill not found with upload_id: {upload_id}")
     
-    # Transform to BillInput format
+    # Transform to BillInput format (with optional hospital override)
     try:
-        bill_input = transform_mongodb_bill_to_input(doc)
+        bill_input = transform_mongodb_bill_to_input(doc, hospital_name=hospital_name)
     except Exception as e:
         logger.error(f"Failed to transform bill document: {e}", exc_info=True)
         raise ValueError(f"Invalid bill document format: {str(e)}")

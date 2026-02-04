@@ -146,6 +146,8 @@ class MongoDBClient:
                 "grand_total": data.get("grand_total", 0.0),
                 "raw_ocr_text": data.get("raw_ocr_text"),
                 "status": data.get("status", "complete"),
+                # Store hospital name metadata for verification (NOT extracted from bill)
+                "hospital_name_metadata": data.get("hospital_name_metadata"),
             },
         }
 

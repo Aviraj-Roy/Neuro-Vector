@@ -127,11 +127,15 @@ class PatientInfo(BaseModel):
         return v.strip()
 
 class BillHeader(BaseModel):
-    """Bill header / metadata."""
+    """Bill header / metadata.
+    
+    NOTE: hospital_name is NO LONGER stored in MongoDB.
+    Hospital selection happens at upload time and is used for verification only.
+    """
     # Bill numbers may appear multiple times; keep a primary plus a set.
     primary_bill_number: Optional[str] = None
     bill_numbers: List[str] = Field(default_factory=list)
-    hospital_name: Optional[str] = None
+    # hospital_name: REMOVED - provided at upload time, not extracted
     hospital_address: Optional[str] = None
     billing_date: Optional[str] = None
     visit_number: Optional[str] = None

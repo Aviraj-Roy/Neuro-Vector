@@ -107,17 +107,24 @@ def validate_extraction(bill_data: Dict[str, Any]) -> List[str]:
 # =============================================================================
 # Main Processing Pipeline
 # =============================================================================
-def process_bill(pdf_path: str, upload_id: str | None = None, auto_cleanup: bool = True) -> str:
+def process_bill(
+    pdf_path: str, 
+    hospital_name: str,  # NEW: Required parameter for hospital selection
+    upload_id: str | None = None, 
+    auto_cleanup: bool = True
+) -> str:
     """Process a medical bill PDF and persist ONE MongoDB document.
 
     Business rules enforced:
     - One PDF upload == one MongoDB document, even if multiple pages/bill numbers.
+    - Hospital name is provided explicitly (NOT extracted from bill).
     - Payments are NOT medical services.
     - No hardcoded hospital/test names.
     - Temporary images are cleaned up after successful OCR + DB save.
 
     Args:
         pdf_path: Path to the PDF file
+        hospital_name: Name of the hospital (used for tie-up rate selection during verification)
         upload_id: Optional stable upload ID (generated if not provided)
         auto_cleanup: Whether to automatically cleanup images after success (default: True)
 
@@ -126,8 +133,16 @@ def process_bill(pdf_path: str, upload_id: str | None = None, auto_cleanup: bool
 
     Raises:
         ExtractionValidationError: If critical validation fails
+        ValueError: If hospital_name is invalid
     """
     upload_id = upload_id or uuid.uuid4().hex
+    
+    # Validate hospital_name parameter
+    if not hospital_name or not isinstance(hospital_name, str) or not hospital_name.strip():
+        raise ValueError("hospital_name must be a non-empty string")
+    
+    hospital_name = hospital_name.strip()
+    logger.info(f"Processing bill for hospital: {hospital_name}")
     
     # Track pipeline success for cleanup decision
     ocr_success = False
@@ -148,6 +163,7 @@ def process_bill(pdf_path: str, upload_id: str | None = None, auto_cleanup: bool
 
         # 4) Extract bill-scoped structured data (three-stage pipeline)
         #    This returns fully aggregated data across ALL pages
+        #    NOTE: Hospital name is NOT extracted - it's provided as parameter
         bill_data = extract_bill_data(ocr_result)
 
         # 5) Add immutable metadata BEFORE validation
@@ -155,7 +171,11 @@ def process_bill(pdf_path: str, upload_id: str | None = None, auto_cleanup: bool
         bill_data["upload_id"] = upload_id
         bill_data["source_pdf"] = os.path.basename(pdf_path)
         bill_data["page_count"] = len(image_paths)
-        bill_data.setdefault("schema_version", 1)
+        bill_data.setdefault("schema_version", 2)  # Bump to v2 (hospital not in schema)
+        
+        # Store hospital_name as metadata (NOT in header, used for verification only)
+        # This is stored at document root level for easy access during verification
+        bill_data["hospital_name_metadata"] = hospital_name
 
         # 6) Post-extraction validation on FINAL aggregated object
         #    This runs exactly ONCE per upload_id after full aggregation
