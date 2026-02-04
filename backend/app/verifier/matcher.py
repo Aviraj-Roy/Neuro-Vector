@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 # Similarity thresholds (loaded from env or defaults)
 CATEGORY_SIMILARITY_THRESHOLD = float(os.getenv("CATEGORY_SIMILARITY_THRESHOLD", "0.70"))
+CATEGORY_SOFT_THRESHOLD = float(os.getenv("CATEGORY_SOFT_THRESHOLD", "0.65"))  # Soft acceptance
 ITEM_SIMILARITY_THRESHOLD = float(os.getenv("ITEM_SIMILARITY_THRESHOLD", "0.85"))
 
 
@@ -543,17 +544,27 @@ class SemanticMatcher:
         """
         self._total_matches += 1
         
-        # Normalize bill item text before matching
-        from app.verifier.text_normalizer import normalize_bill_item_text
-        normalized_item_name = normalize_bill_item_text(item_name)
+        # CRITICAL: Extract medical core FIRST (before any other processing)
+        # This removes inventory metadata: lot numbers, SKUs, expiry dates, brand suffixes
+        # Example: "(30049099) NICORANDIL-TABLET-5MG-KORANDIL- |GTF" → "nicorandil 5mg"
+        from app.verifier.medical_core_extractor import extract_medical_core
+        medical_core = extract_medical_core(item_name)
         
-        # Log normalization for debugging
-        if normalized_item_name != item_name.lower().strip():
+        # Then normalize the medical core (remove doctor names, etc.)
+        from app.verifier.text_normalizer import normalize_bill_item_text
+        normalized_item_name = normalize_bill_item_text(medical_core)
+        
+        # Log extraction and normalization for debugging
+        if medical_core != item_name.lower().strip():
             logger.debug(
-                f"Normalized item: '{item_name}' → '{normalized_item_name}'"
+                f"Medical core extracted: '{item_name}' → '{medical_core}'"
+            )
+        if normalized_item_name != medical_core.lower().strip():
+            logger.debug(
+                f"Normalized: '{medical_core}' → '{normalized_item_name}'"
             )
         
-        # Use normalized text for matching
+        # Use normalized medical core for matching
         item_name_for_matching = normalized_item_name if normalized_item_name else item_name
         
         cat_key = (hospital_name.lower(), category_name.lower())
@@ -617,7 +628,30 @@ class SemanticMatcher:
                 item=item
             )
         
+        # Try partial semantic matching (NEW: handles partial matches)
+        # This allows "consultation first visit" to match "consultation"
+        from app.verifier.partial_matcher import is_partial_match
+        
+        is_match, confidence, reason = is_partial_match(
+            bill_item=item_name_for_matching,
+            tieup_item=matched_name.lower(),
+            semantic_similarity=similarity,
+        )
+        
+        if is_match:
+            logger.info(
+                f"Partial match accepted: '{item_name}' → '{matched_name}' "
+                f"(semantic={similarity:.4f}, confidence={confidence:.4f}, reason={reason})"
+            )
+            return ItemMatch(
+                matched_text=matched_name,
+                similarity=confidence,  # Use combined confidence
+                index=idx,
+                item=item
+            )
+        
         # Use LLM for borderline cases (0.70 <= similarity < 0.85)
+        # Only if partial matching also failed
         if use_llm and similarity >= CATEGORY_SIMILARITY_THRESHOLD:
             self._llm_calls += 1
             logger.info(
@@ -650,7 +684,11 @@ class SemanticMatcher:
                     f"(confidence={llm_result.confidence:.4f}, error={llm_result.error})"
                 )
         
-        # No match (either below threshold or LLM rejected)
+        # No match (either below threshold, partial match failed, or LLM rejected)
+        logger.debug(
+            f"Item rejected: '{item_name}' → '{matched_name}' "
+            f"(semantic={similarity:.4f}, partial_match={reason if 'reason' in locals() else 'not_tried'})"
+        )
         return ItemMatch(
             matched_text=matched_name,
             similarity=similarity,

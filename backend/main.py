@@ -175,8 +175,14 @@ Available hospitals are determined by JSON files in backend/data/tieups/
                             status = item.get('status', 'UNKNOWN')
                             status_icon = "✅" if status == "GREEN" else "❌" if status == "RED" else "⚠️"
                             print(f"    {status_icon} {item.get('bill_item', 'N/A')[:50]} - {status}")
+                            
+                            # Show amounts for all statuses
                             if status == "RED":
                                 print(f"       Bill: ₹{item.get('bill_amount', 0):.2f}, Allowed: ₹{item.get('allowed_amount', 0):.2f}, Extra: ₹{item.get('extra_amount', 0):.2f}")
+                            elif status == "GREEN":
+                                print(f"       Bill: ₹{item.get('bill_amount', 0):.2f}, Allowed: ₹{item.get('allowed_amount', 0):.2f}")
+                            elif status == "MISMATCH":
+                                print(f"       Bill: ₹{item.get('bill_amount', 0):.2f}, Allowed: N/A, Extra: N/A")
                     
                     print("\n" + "="*80)
                     logger.info("Verification complete!")

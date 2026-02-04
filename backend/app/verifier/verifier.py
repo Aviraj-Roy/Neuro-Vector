@@ -279,18 +279,30 @@ class BillVerifier:
             category_similarity=category_match.similarity,
         )
         
-        # If category doesn't match threshold, all items are MISMATCH
-        if not category_match.is_match:
-            logger.warning(
-                f"Category mismatch: '{bill_category.category_name}' "
-                f"(best similarity={category_match.similarity:.4f} < {CATEGORY_SIMILARITY_THRESHOLD})"
-            )
-            for bill_item in bill_category.items:
-                item_result = self._create_mismatch_item_result(bill_item)
-                result.items.append(item_result)
-            return result
+        # Soft category acceptance: 0.65 <= similarity < 0.70
+        # Accept category but log as INFO (not WARNING)
+        from app.verifier.matcher import CATEGORY_SOFT_THRESHOLD
         
-        # Process each item in the category
+        if not category_match.is_match:
+            # Check if it's a soft match (0.65 <= similarity < 0.70)
+            if category_match.similarity >= CATEGORY_SOFT_THRESHOLD:
+                logger.info(
+                    f"Category soft match: '{bill_category.category_name}' → '{category_match.matched_text}' "
+                    f"(similarity={category_match.similarity:.4f}, threshold={CATEGORY_SIMILARITY_THRESHOLD})"
+                )
+                # Accept the category and continue processing items
+            else:
+                # True mismatch (similarity < 0.65)
+                logger.warning(
+                    f"Category mismatch: '{bill_category.category_name}' "
+                    f"(best similarity={category_match.similarity:.4f} < {CATEGORY_SOFT_THRESHOLD})"
+                )
+                for bill_item in bill_category.items:
+                    item_result = self._create_mismatch_item_result(bill_item)
+                    result.items.append(item_result)
+                return result
+        
+        # Process each item in the category (for both hard and soft matches)
         for bill_item in bill_category.items:
             item_result = self._verify_item(
                 bill_item=bill_item,
