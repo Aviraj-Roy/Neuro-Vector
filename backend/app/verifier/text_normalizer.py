@@ -229,6 +229,55 @@ def is_non_medical_artifact(text: str) -> bool:
     return False
 
 
+def is_administrative_charge(text: str) -> bool:
+    """
+    Check if text represents an administrative charge (non-comparable item).
+    
+    PHASE-1 REQUIREMENT: Identify administrative/processing charges that:
+    - Exist in the bill
+    - Cannot be compared against tie-up rates
+    - Should be marked as ALLOWED_NOT_COMPARABLE
+    
+    Examples:
+        "Registration Fee" → True
+        "Admission Charges" → True
+        "Processing Fee" → True
+        "File Charges" → True
+        "Consultation" → False (this is a medical service)
+        "X-Ray" → False (this is a medical service)
+    
+    Args:
+        text: Item name to check
+        
+    Returns:
+        True if item is an administrative charge, False otherwise
+    """
+    if not text or not isinstance(text, str):
+        return False
+    
+    text_lower = text.strip().lower()
+    
+    # PHASE-1: Administrative charge patterns
+    ADMIN_PATTERNS = [
+        r'\b(registration|admission|processing|file)\s+(fee|charge)s?\b',
+        r'\b(hospital|facility|service)\s+(fee|charge)s?\b',
+        r'\badmin(istrative)?\s+(fee|charge)s?\b',
+        r'\bdeposit\b',
+        r'\badvance\s+payment\b',
+        r'\bmiscellaneous\s+(fee|charge)s?\b',
+        r'\bconveyance\s+(fee|charge)s?\b',
+        r'\bdocument(ation)?\s+(fee|charge)s?\b',
+        r'\brecord\s+(fee|charge)s?\b',
+        r'\bcertificate\s+(fee|charge)s?\b',
+    ]
+    
+    for pattern in ADMIN_PATTERNS:
+        if re.search(pattern, text_lower):
+            return True
+    
+    return False
+
+
 def preprocess_for_matching(
     text: str,
     text_type: str = "item"

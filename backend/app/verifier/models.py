@@ -27,6 +27,15 @@ class VerificationStatus(str, Enum):
     GREEN = "GREEN"       # Bill amount <= allowed amount
     RED = "RED"           # Bill amount > allowed amount (overcharged)
     MISMATCH = "MISMATCH" # No matching item found in tie-up rates
+    ALLOWED_NOT_COMPARABLE = "ALLOWED_NOT_COMPARABLE"  # Item exists but no valid price comparison
+
+
+class FailureReason(str, Enum):
+    """Reason for MISMATCH or ALLOWED_NOT_COMPARABLE status."""
+    NOT_IN_TIEUP = "NOT_IN_TIEUP"           # No match found in tie-up
+    LOW_SIMILARITY = "LOW_SIMILARITY"        # Best match below threshold
+    PACKAGE_ONLY = "PACKAGE_ONLY"            # Only exists as package item
+    ADMIN_CHARGE = "ADMIN_CHARGE"            # Administrative/artifact item
 
 
 # =============================================================================
@@ -79,6 +88,14 @@ class TieUpRateSheet(BaseModel):
 # Verification Output Models
 # =============================================================================
 
+class MismatchDiagnostics(BaseModel):
+    """Diagnostics for items that couldn't be matched (MISMATCH or ALLOWED_NOT_COMPARABLE)."""
+    normalized_item_name: str
+    best_candidate: Optional[str] = None  # Only if similarity > 0.5
+    attempted_category: str
+    failure_reason: FailureReason
+
+
 class ItemVerificationResult(BaseModel):
     """Result of verifying a single bill item."""
     bill_item: str
@@ -89,6 +106,9 @@ class ItemVerificationResult(BaseModel):
     extra_amount: float = 0.0
     # Additional metadata for debugging
     similarity_score: Optional[float] = None
+    # PHASE-1: Enhanced fields for exhaustive matching
+    normalized_item_name: Optional[str] = None  # Show normalization applied
+    diagnostics: Optional[MismatchDiagnostics] = None  # For non-GREEN/RED items
 
 
 class CategoryVerificationResult(BaseModel):

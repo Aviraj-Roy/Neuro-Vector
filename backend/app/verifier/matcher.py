@@ -85,6 +85,7 @@ class CategoryMatch(MatchResult):
 class ItemMatch(MatchResult):
     """Item match result with tie-up item reference."""
     item: Optional[TieUpItem] = None
+    normalized_item_name: Optional[str] = None  # PHASE-1: Track normalization for diagnostics
 
 
 # =============================================================================
@@ -575,7 +576,8 @@ class SemanticMatcher:
                 matched_text=None,
                 similarity=0.0,
                 index=-1,
-                item=None
+                item=None,
+                normalized_item_name=item_name_for_matching
             )
         
         item_index = self._item_indices[cat_key]
@@ -591,6 +593,7 @@ class SemanticMatcher:
                 similarity=0.0,
                 index=-1,
                 item=None,
+                normalized_item_name=item_name_for_matching,
                 error=f"Embedding service temporarily unavailable: {e}"
             )
         except Exception as e:
@@ -600,6 +603,7 @@ class SemanticMatcher:
                 similarity=0.0,
                 index=-1,
                 item=None,
+                normalized_item_name=item_name_for_matching,
                 error=f"Embedding error: {e}"
             )
         
@@ -613,7 +617,8 @@ class SemanticMatcher:
                 matched_text=None,
                 similarity=0.0,
                 index=-1,
-                item=None
+                item=None,
+                normalized_item_name=item_name_for_matching
             )
         
         # PHASE-1: Evaluate all candidates with hybrid scoring
@@ -651,7 +656,8 @@ class SemanticMatcher:
                 matched_text=None,
                 similarity=0.0,
                 index=-1,
-                item=None
+                item=None,
+                normalized_item_name=item_name_for_matching
             )
         
         idx, matched_name, item, similarity = best_match
@@ -677,7 +683,8 @@ class SemanticMatcher:
                 matched_text=matched_name,
                 similarity=best_hybrid_score,  # Use hybrid score as confidence
                 index=idx,
-                item=item
+                item=item,
+                normalized_item_name=item_name_for_matching
             )
         
         # Try partial semantic matching (EXISTING LOGIC - now as fallback)
@@ -699,7 +706,8 @@ class SemanticMatcher:
                 matched_text=matched_name,
                 similarity=confidence,  # Use combined confidence
                 index=idx,
-                item=item
+                item=item,
+                normalized_item_name=item_name_for_matching
             )
         
         # Use LLM for borderline cases (0.55 <= similarity < 0.60)
@@ -728,7 +736,8 @@ class SemanticMatcher:
                     matched_text=matched_name,
                     similarity=llm_result.confidence,  # Use LLM confidence
                     index=idx,
-                    item=item
+                    item=item,
+                    normalized_item_name=item_name_for_matching
                 )
             else:
                 # LLM rejected or failed
@@ -746,7 +755,8 @@ class SemanticMatcher:
             matched_text=matched_name,
             similarity=similarity,
             index=-1,
-            item=None
+            item=None,
+            normalized_item_name=item_name_for_matching
         )
     
     def clear_indices(self):

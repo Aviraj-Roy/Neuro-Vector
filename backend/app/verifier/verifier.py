@@ -324,15 +324,49 @@ class BillVerifier:
         """
         Verify a single item.
         
+        PHASE-1: EXHAUSTIVE MATCHING
+        - Every item MUST produce a result (no None returns)
+        - Administrative charges get ALLOWED_NOT_COMPARABLE status
+        - All non-GREEN/RED items get diagnostics
+        
         Args:
             bill_item: Item from the bill
             hospital_name: Matched hospital name
             category_name: Matched category name
             
         Returns:
-            ItemVerificationResult
+            ItemVerificationResult (NEVER None)
         """
-        # Match item
+        # PHASE-1: Check if this is an administrative charge FIRST
+        from app.verifier.text_normalizer import is_administrative_charge
+        
+        if is_administrative_charge(bill_item.item_name):
+            # Administrative charges cannot be compared against tie-up rates
+            from app.verifier.models import FailureReason, MismatchDiagnostics, VerificationStatus
+            
+            logger.info(
+                f"Administrative charge detected: '{bill_item.item_name}' "
+                f"(marked as ALLOWED_NOT_COMPARABLE)"
+            )
+            
+            return ItemVerificationResult(
+                bill_item=bill_item.item_name,
+                matched_item=None,
+                status=VerificationStatus.ALLOWED_NOT_COMPARABLE,
+                bill_amount=bill_item.amount,
+                allowed_amount=0.0,  # N/A
+                extra_amount=0.0,    # N/A
+                similarity_score=None,
+                normalized_item_name=bill_item.item_name.lower().strip(),
+                diagnostics=MismatchDiagnostics(
+                    normalized_item_name=bill_item.item_name.lower().strip(),
+                    best_candidate=None,
+                    attempted_category=category_name,
+                    failure_reason=FailureReason.ADMIN_CHARGE
+                )
+            )
+        
+        # Match item (this ALWAYS returns a result, never None)
         item_match = self.matcher.match_item(
             item_name=bill_item.item_name,
             hospital_name=hospital_name,
@@ -340,7 +374,7 @@ class BillVerifier:
             threshold=ITEM_SIMILARITY_THRESHOLD,
         )
         
-        # Check price
+        # Check price if match found
         if item_match.is_match and item_match.item is not None:
             price_result = check_price(
                 bill_amount=bill_item.amount,
@@ -356,21 +390,53 @@ class BillVerifier:
                 allowed_amount=price_result.allowed_amount,
                 extra_amount=price_result.extra_amount,
                 similarity_score=item_match.similarity,
+                normalized_item_name=item_match.normalized_item_name,
+                diagnostics=None  # No diagnostics for GREEN/RED
             )
         else:
-            # Item mismatch
+            # Item mismatch - create diagnostics
             logger.debug(
                 f"Item mismatch: '{bill_item.item_name}' "
                 f"(best similarity={item_match.similarity:.4f} < {ITEM_SIMILARITY_THRESHOLD})"
             )
-            return self._create_mismatch_item_result(bill_item, item_match.similarity)
+            return self._create_mismatch_item_result(
+                bill_item=bill_item,
+                item_match=item_match,
+                category_name=category_name
+            )
     
     def _create_mismatch_item_result(
         self,
         bill_item: BillItem,
-        similarity: float = 0.0,
+        item_match,  # ItemMatch from matcher
+        category_name: str,
     ) -> ItemVerificationResult:
-        """Create a MISMATCH result for an item."""
+        """
+        Create a MISMATCH result for an item with diagnostics.
+        
+        PHASE-1: EXHAUSTIVE MATCHING
+        - Always include diagnostics explaining why the item didn't match
+        - Include best candidate if similarity > 0.5
+        - Include failure reason
+        """
+        from app.verifier.models import FailureReason, MismatchDiagnostics
+        
+        # Determine failure reason
+        if item_match.similarity < 0.5:
+            failure_reason = FailureReason.NOT_IN_TIEUP
+            best_candidate = None  # Too low similarity to show candidate
+        else:
+            failure_reason = FailureReason.LOW_SIMILARITY
+            best_candidate = item_match.matched_text  # Show best candidate
+        
+        # Create diagnostics
+        diagnostics = MismatchDiagnostics(
+            normalized_item_name=item_match.normalized_item_name or bill_item.item_name.lower().strip(),
+            best_candidate=best_candidate,
+            attempted_category=category_name,
+            failure_reason=failure_reason
+        )
+        
         return ItemVerificationResult(
             bill_item=bill_item.item_name,
             matched_item=None,
@@ -378,11 +444,22 @@ class BillVerifier:
             bill_amount=bill_item.amount,
             allowed_amount=0.0,
             extra_amount=0.0,
-            similarity_score=similarity,
+            similarity_score=item_match.similarity,
+            normalized_item_name=item_match.normalized_item_name,
+            diagnostics=diagnostics
         )
     
     def _create_all_mismatch_response(self, bill: BillInput) -> VerificationResponse:
-        """Create a response where everything is MISMATCH (no hospital match)."""
+        """
+        Create a response where everything is MISMATCH (no hospital match).
+        
+        PHASE-1: EXHAUSTIVE MATCHING
+        - Every item gets diagnostics
+        - Failure reason: NOT_IN_TIEUP (hospital not matched)
+        """
+        from app.verifier.models import FailureReason, MismatchDiagnostics
+        from app.verifier.text_normalizer import should_skip_category
+        
         response = VerificationResponse(
             hospital=bill.hospital_name,
             matched_hospital=None,
@@ -390,6 +467,10 @@ class BillVerifier:
         )
         
         for bill_category in bill.categories:
+            # Skip pseudo-categories even when hospital doesn't match
+            if should_skip_category(bill_category.category_name):
+                continue
+            
             category_result = CategoryVerificationResult(
                 category=bill_category.category_name,
                 matched_category=None,
@@ -397,7 +478,26 @@ class BillVerifier:
             )
             
             for bill_item in bill_category.items:
-                item_result = self._create_mismatch_item_result(bill_item)
+                # Create MISMATCH with diagnostics (hospital not found)
+                diagnostics = MismatchDiagnostics(
+                    normalized_item_name=bill_item.item_name.lower().strip(),
+                    best_candidate=None,
+                    attempted_category=bill_category.category_name,
+                    failure_reason=FailureReason.NOT_IN_TIEUP
+                )
+                
+                item_result = ItemVerificationResult(
+                    bill_item=bill_item.item_name,
+                    matched_item=None,
+                    status=VerificationStatus.MISMATCH,
+                    bill_amount=bill_item.amount,
+                    allowed_amount=0.0,
+                    extra_amount=0.0,
+                    similarity_score=0.0,
+                    normalized_item_name=bill_item.item_name.lower().strip(),
+                    diagnostics=diagnostics
+                )
+                
                 category_result.items.append(item_result)
                 response.total_bill_amount += bill_item.amount
                 response.mismatch_count += 1
