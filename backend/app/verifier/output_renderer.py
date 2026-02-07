@@ -39,6 +39,11 @@ def validate_completeness(
     
     PHASE-7 CRITICAL: This ensures no items are lost during processing.
     
+    PHASE-7 UPDATE: Excludes artifact items from validation:
+    - Items in "Hospital - " category (with trailing space)
+    - Items with name "UNKNOWN" and amount ₹0
+    - These are legacy OCR artifacts that should not participate in verification
+    
     Args:
         bill_input: Original bill input
         verification_response: Verification result
@@ -48,13 +53,29 @@ def validate_completeness(
         - is_complete: True if all items present exactly once
         - error_message: Empty if complete, otherwise describes the issue
     """
-    # Count input items
+    from app.db.artifact_filter import is_artifact_item
+    
+    # Count input items (excluding artifacts)
     input_items = []
+    filtered_count = 0
+    
     for category in bill_input.categories:
         for item in category.items:
+            # PHASE-7: Skip artifacts
+            if is_artifact_item(category.category_name, item.item_name, item.amount, item.amount):
+                filtered_count += 1
+                logger.debug(
+                    f"Excluding artifact from validation: [{category.category_name}] "
+                    f"{item.item_name} - ₹{item.amount}"
+                )
+                continue
+            
             input_items.append((category.category_name, item.item_name, item.amount))
     
     input_count = len(input_items)
+    
+    if filtered_count > 0:
+        logger.info(f"Excluded {filtered_count} artifact items from completeness validation")
     
     # Count output items
     output_items = []

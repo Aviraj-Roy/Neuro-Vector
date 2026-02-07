@@ -108,8 +108,23 @@ class MongoDBClient:
         - Payments are NOT stored (removed per choice C to prevent total pollution)
         - Discounts are stored in summary.discounts (not in items or totals)
         - grand_total reflects only billable items
+        
+        PHASE-7 Guardrail:
+        - Filters out legacy OCR artifacts before insertion
+        - Prevents "Hospital - / UNKNOWN / ₹0" items from entering DB
         """
-
+        
+        # PHASE-7: Filter artifacts before validation/transformation
+        from app.db.artifact_filter import filter_artifact_items, validate_bill_items
+        
+        bill_data = filter_artifact_items(bill_data)
+        
+        # PHASE-7: Final validation check
+        is_valid, error_msg = validate_bill_items(bill_data)
+        if not is_valid:
+            logger.error(f"⚠️  Bill validation failed: {error_msg}")
+            # Continue anyway but log the issue
+        
         data = self._validate_and_transform(bill_data)
 
         header = data.get("header", {}) or {}
