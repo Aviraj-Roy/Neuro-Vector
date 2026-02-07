@@ -278,31 +278,33 @@ class BillVerifier:
             matched_category=category_match.matched_text,
             category_similarity=category_match.similarity,
         )
-        
-        # Soft category acceptance: 0.65 <= similarity < 0.70
-        # Accept category but log as INFO (not WARNING)
+        # PHASE-1: Soft category acceptance - ALWAYS process items
+        # Even if category confidence is low, still try to match items
+        # Category is used to narrow search space, not to block matching
         from app.verifier.matcher import CATEGORY_SOFT_THRESHOLD
         
         if not category_match.is_match:
-            # Check if it's a soft match (0.65 <= similarity < 0.70)
-            if category_match.similarity >= CATEGORY_SOFT_THRESHOLD:
+            # Check if it's a soft match (0.50 <= similarity < 0.70)
+            if category_match.similarity >= 0.50:  # PHASE-1: Lowered from 0.65
                 logger.info(
                     f"Category soft match: '{bill_category.category_name}' → '{category_match.matched_text}' "
-                    f"(similarity={category_match.similarity:.4f}, threshold={CATEGORY_SIMILARITY_THRESHOLD})"
+                    f"(similarity={category_match.similarity:.4f}), continuing to match items"
                 )
-                # Accept the category and continue processing items
             else:
-                # True mismatch (similarity < 0.65)
+                # Very low category confidence, but STILL try to match items (PHASE-1)
                 logger.warning(
-                    f"Category mismatch: '{bill_category.category_name}' "
-                    f"(best similarity={category_match.similarity:.4f} < {CATEGORY_SOFT_THRESHOLD})"
+                    f"Low category confidence: '{bill_category.category_name}' → '{category_match.matched_text}' "
+                    f"(similarity={category_match.similarity:.4f}), but STILL trying to match items (Phase-1 behavior)"
                 )
-                for bill_item in bill_category.items:
-                    item_result = self._create_mismatch_item_result(bill_item)
-                    result.items.append(item_result)
-                return result
+                # PHASE-1: DO NOT block items, continue processing
+                # Old behavior (commented out):
+                # for bill_item in bill_category.items:
+                #     item_result = self._create_mismatch_item_result(bill_item)
+                #     result.items.append(item_result)
+                # return result
         
-        # Process each item in the category (for both hard and soft matches)
+        # PHASE-1: ALWAYS process items (regardless of category confidence)
+        # This maximizes coverage and minimizes false negatives
         for bill_item in bill_category.items:
             item_result = self._verify_item(
                 bill_item=bill_item,

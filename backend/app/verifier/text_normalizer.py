@@ -173,6 +173,62 @@ def should_skip_category(category_name: str) -> bool:
     return False
 
 
+def is_non_medical_artifact(text: str) -> bool:
+    """
+    Check if text is a non-medical artifact that should be ignored.
+    
+    PHASE-1 REQUIREMENT: Explicitly ignore lines containing:
+    - Internal IDs (pure numbers, alphanumeric codes)
+    - Lot numbers (LOT:ABC123)
+    - Batch codes (BATCH:XYZ789)
+    - Expiry metadata (EXP:12/2025)
+    - Inventory / SKU noise
+    
+    These should NOT affect similarity scoring.
+    
+    Examples:
+        "123456789" → True (pure number)
+        "LOT:ABC123" → True (lot number)
+        "BATCH:XYZ789" → True (batch code)
+        "EXP:12/2025" → True (expiry date)
+        "SKU:ABC-123-XYZ" → True (SKU code)
+        "PARACETAMOL 500MG" → False (valid medical item)
+    
+    Args:
+        text: Text to check
+        
+    Returns:
+        True if text is a non-medical artifact, False otherwise
+    """
+    if not text or not isinstance(text, str):
+        return True  # Empty is an artifact
+    
+    text_upper = text.strip().upper()
+    
+    # Empty or very short
+    if len(text_upper) < 2:
+        return True
+    
+    # PHASE-1: Non-medical artifact patterns
+    NON_MEDICAL_PATTERNS = [
+        r'^\d+$',  # Pure numbers (e.g., "123456789")
+        r'^[A-Z0-9]{10,}$',  # Long alphanumeric codes (e.g., "ABC123XYZ456")
+        r'\bLOT[:\s]*[A-Z0-9\-]+',  # Lot numbers
+        r'\bBATCH[:\s]*[A-Z0-9\-]+',  # Batch codes
+        r'\bEXP[:\s]*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',  # Expiry dates
+        r'\bSKU[:\s]*[A-Z0-9\-]+',  # SKU codes
+        r'^\s*$',  # Whitespace only
+        r'^[\W_]+$',  # Only special characters
+        r'^\(\d+\)$',  # Just a code in parentheses
+    ]
+    
+    for pattern in NON_MEDICAL_PATTERNS:
+        if re.match(pattern, text_upper):
+            return True
+    
+    return False
+
+
 def preprocess_for_matching(
     text: str,
     text_type: str = "item"

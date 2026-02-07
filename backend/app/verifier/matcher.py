@@ -603,8 +603,11 @@ class SemanticMatcher:
                 error=f"Embedding error: {e}"
             )
         
-        # Find best match
-        results = item_index.search(query_embedding, k=1)
+        # Find best match using TOP-K strategy (PHASE-1 ENHANCEMENT)
+        # Instead of just taking top-1 semantic match, evaluate top-3 with hybrid scoring
+        k = min(3, item_index.size)  # Get top-3 candidates (or fewer if index is small)
+        results = item_index.search(query_embedding, k=k)
+        
         if not results:
             return ItemMatch(
                 matched_text=None,
@@ -613,22 +616,71 @@ class SemanticMatcher:
                 item=None
             )
         
-        idx, similarity = results[0]
-        matched_name = item_index.texts[idx]
-        item = item_refs[idx]
+        # PHASE-1: Evaluate all candidates with hybrid scoring
+        from app.verifier.partial_matcher import calculate_hybrid_score
         
-        logger.debug(f"Item match: '{item_name_for_matching}' → '{matched_name}' (sim={similarity:.4f})")
+        best_match = None
+        best_hybrid_score = 0.0
+        best_breakdown = None
         
-        # Auto-match for high similarity
-        if similarity >= threshold:
+        for idx, semantic_sim in results:
+            matched_name = item_index.texts[idx]
+            item = item_refs[idx]
+            
+            # Calculate hybrid score for this candidate
+            hybrid_score, breakdown = calculate_hybrid_score(
+                bill_item=item_name_for_matching,
+                tieup_item=matched_name.lower(),
+                semantic_similarity=semantic_sim,
+            )
+            
+            logger.debug(
+                f"Candidate {idx+1}: '{matched_name}' "
+                f"(semantic={semantic_sim:.4f}, hybrid={hybrid_score:.4f})"
+            )
+            
+            # Track best hybrid score
+            if hybrid_score > best_hybrid_score:
+                best_hybrid_score = hybrid_score
+                best_match = (idx, matched_name, item, semantic_sim)
+                best_breakdown = breakdown
+        
+        # Use best match if found
+        if best_match is None:
+            return ItemMatch(
+                matched_text=None,
+                similarity=0.0,
+                index=-1,
+                item=None
+            )
+        
+        idx, matched_name, item, similarity = best_match
+        
+        logger.debug(
+            f"Best match: '{item_name_for_matching}' → '{matched_name}' "
+            f"(semantic={similarity:.4f}, hybrid={best_hybrid_score:.4f}, "
+            f"tok={best_breakdown['token_overlap']:.2f}, "
+            f"cont={best_breakdown['containment']:.2f})"
+        )
+        
+        # PHASE-1: Use hybrid score threshold (0.60) instead of pure semantic threshold
+        # This allows matches with lower semantic similarity but high token overlap
+        HYBRID_SCORE_THRESHOLD = 0.60
+        
+        # Auto-match for high hybrid score
+        if best_hybrid_score >= HYBRID_SCORE_THRESHOLD:
+            logger.info(
+                f"Hybrid match accepted: '{item_name}' → '{matched_name}' "
+                f"(hybrid={best_hybrid_score:.4f})"
+            )
             return ItemMatch(
                 matched_text=matched_name,
-                similarity=similarity,
+                similarity=best_hybrid_score,  # Use hybrid score as confidence
                 index=idx,
                 item=item
             )
         
-        # Try partial semantic matching (NEW: handles partial matches)
+        # Try partial semantic matching (EXISTING LOGIC - now as fallback)
         # This allows "consultation first visit" to match "consultation"
         from app.verifier.partial_matcher import is_partial_match
         
@@ -650,10 +702,10 @@ class SemanticMatcher:
                 item=item
             )
         
-        # Use LLM for borderline cases (0.65 <= similarity < 0.85)
-        # Only if partial matching also failed
-        # Use CATEGORY_SOFT_THRESHOLD (0.65) to align with category soft acceptance
-        if use_llm and similarity >= CATEGORY_SOFT_THRESHOLD:
+        # Use LLM for borderline cases (0.55 <= similarity < 0.60)
+        # PHASE-1: Lowered threshold from 0.65 to 0.55
+        PHASE1_LLM_THRESHOLD = 0.55
+        if use_llm and similarity >= PHASE1_LLM_THRESHOLD:
             self._llm_calls += 1
             logger.info(
                 f"Borderline similarity ({similarity:.4f}), using LLM for verification"
