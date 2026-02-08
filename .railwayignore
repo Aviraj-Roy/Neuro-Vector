@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Documentation (keep README)
+docs/
+*.md
+!README.md
+
+# Local data and uploads
+backend/uploads/
+backend/data/embedding_cache.json
+*.pdf
+*.png
+*.jpg
+*.jpeg
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Environment files (use Railway env vars instead)
+.env
+.env.local
+.env.production
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Render-specific (not needed for Railway)
+RENDER_*.md

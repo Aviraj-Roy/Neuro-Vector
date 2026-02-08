@@ -44,7 +44,7 @@ DEFAULT_PRIMARY_LLM = "phi3:mini"
 DEFAULT_SECONDARY_LLM = "qwen2.5:3b"
 DEFAULT_RUNTIME = "ollama"
 DEFAULT_BASE_URL = "http://localhost:11434"
-DEFAULT_TIMEOUT = 150
+DEFAULT_TIMEOUT = 300
 DEFAULT_MIN_CONFIDENCE = 0.7
 
 # Similarity thresholds
@@ -168,11 +168,15 @@ No explanations. No extra text."""
         Args:
             primary_model: Primary LLM model name
             secondary_model: Fallback LLM model name
-            runtime: Runtime to use ('ollama' or 'vllm')
+            runtime: Runtime to use ('ollama' or 'vllm' or 'disabled')
             base_url: Base URL for LLM service
             timeout: Request timeout in seconds
             min_confidence: Minimum confidence threshold
         """
+        # Check if LLM matching is enabled (Railway: default to FALSE)
+        enable_llm = os.getenv("ENABLE_LLM_MATCHING", "false").lower() in ("true", "1", "yes")
+        disable_ollama = os.getenv("DISABLE_OLLAMA", "true").lower() in ("true", "1", "yes")
+        
         self.primary_model = primary_model or os.getenv("PRIMARY_LLM", DEFAULT_PRIMARY_LLM)
         self.secondary_model = secondary_model or os.getenv("SECONDARY_LLM", DEFAULT_SECONDARY_LLM)
         self.runtime = runtime or os.getenv("LLM_RUNTIME", DEFAULT_RUNTIME)
@@ -188,11 +192,49 @@ No explanations. No extra text."""
         self._secondary_calls = 0
         self._cache_hits = 0
         
-        logger.info(
-            f"LLMRouter initialized: primary={self.primary_model}, "
-            f"secondary={self.secondary_model}, runtime={self.runtime}, "
-            f"base_url={self.base_url}"
-        )
+        # Check if LLM is available
+        self._llm_available = False
+        
+        if disable_ollama or not enable_llm or self.runtime == "disabled":
+            logger.info("⚠️  LLM Matching: DISABLED")
+            logger.info("   Reason: ENABLE_LLM_MATCHING=false or DISABLE_OLLAMA=true")
+            logger.info("   Verification will use embedding similarity only")
+            self._llm_available = False
+        else:
+            # Test LLM connectivity
+            self._llm_available = self._test_llm_connection()
+            
+            if self._llm_available:
+                logger.info(
+                    f"✅ LLMRouter initialized: primary={self.primary_model}, "
+                    f"secondary={self.secondary_model}, runtime={self.runtime}, "
+                    f"base_url={self.base_url}"
+                )
+            else:
+                logger.warning(
+                    f"⚠️  LLM service not reachable at {self.base_url}. "
+                    f"LLM-based matching will be disabled. "
+                    f"Verification will continue with embedding similarity only."
+                )
+    
+    def _test_llm_connection(self) -> bool:
+        """Test if LLM service is available.
+        
+        Returns:
+            True if LLM is reachable, False otherwise
+        """
+        try:
+            import requests
+            if self.runtime == "ollama":
+                # Test Ollama health endpoint
+                response = requests.get(f"{self.base_url}/api/tags", timeout=2)
+                return response.status_code == 200
+            else:
+                # For other runtimes, assume available
+                return True
+        except Exception as e:
+            logger.debug(f"LLM health check failed: {e}")
+            return False
     
     def _call_ollama(self, model: str, prompt: str) -> Tuple[Optional[str], Optional[str]]:
         """
@@ -399,7 +441,32 @@ No explanations. No extra text."""
             self._cache.set(bill_item, tieup_item, result)
             return result
         
-        # Borderline case: Use LLM
+        # Borderline case: Use LLM (if available)
+        if not self._llm_available:
+            # LLM not available, use conservative threshold
+            logger.info(
+                f"LLM not available for borderline match: '{bill_item}' <-> '{tieup_item}' (sim={similarity:.4f})"
+            )
+            logger.info("   Using conservative threshold (0.80) instead")
+            
+            # Use 0.80 as conservative threshold when LLM unavailable
+            if similarity >= 0.80:
+                result = LLMMatchResult(
+                    match=True,
+                    confidence=similarity,
+                    normalized_name=tieup_item,
+                    model_used="fallback_threshold",
+                )
+            else:
+                result = LLMMatchResult(
+                    match=False,
+                    confidence=similarity,
+                    normalized_name="",
+                    model_used="fallback_threshold",
+                )
+            self._cache.set(bill_item, tieup_item, result)
+            return result
+        
         logger.info(
             f"LLM matching needed: '{bill_item}' <-> '{tieup_item}' (sim={similarity:.4f})"
         )

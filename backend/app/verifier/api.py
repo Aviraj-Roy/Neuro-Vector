@@ -39,26 +39,74 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan handler - initialize verifier on startup."""
-    logger.info("Starting Bill Verifier API...")
+    """Application lifespan handler - Railway-optimized startup."""
+    logger.info("=" * 80)
+    logger.info("🚂 Starting Bill Verifier API on Railway...")
+    logger.info("=" * 80)
+    
+    # Log environment info
+    env = os.getenv("ENV", "development")
+    railway_env = os.getenv("RAILWAY_ENVIRONMENT", "unknown")
+    port = os.getenv("PORT", "8000")
+    
+    logger.info(f"Environment: {env}")
+    logger.info(f"Railway Environment: {railway_env}")
+    logger.info(f"Port: {port}")
+    
+    # Check LLM status
+    enable_llm = os.getenv("ENABLE_LLM_MATCHING", "false").lower() in ("true", "1", "yes")
+    disable_ollama = os.getenv("DISABLE_OLLAMA", "true").lower() in ("true", "1", "yes")
+    
+    if disable_ollama or not enable_llm:
+        logger.info("⚠️  LLM Matching: DISABLED (using embedding similarity only)")
+    else:
+        ollama_url = os.getenv("LLM_BASE_URL", "http://localhost:11434")
+        logger.info(f"🤖 LLM Matching: ENABLED (URL: {ollama_url})")
+    
+    # Check MongoDB status
+    mongo_uri = os.getenv("MONGO_URI")
+    if mongo_uri:
+        # Mask password in logs
+        if "@" in mongo_uri:
+            masked_uri = mongo_uri.split("@")[1]
+        else:
+            masked_uri = "configured"
+        logger.info(f"📊 MongoDB: Configured ({masked_uri})")
+    else:
+        logger.warning("⚠️  MongoDB: NOT CONFIGURED (MONGO_URI not set)")
     
     # Initialize verifier with tie-up rate sheets
     verifier = get_verifier()
     from app.config import get_tieup_dir
     tieup_dir = os.getenv("TIEUP_DATA_DIR", get_tieup_dir())
     
-    logger.info(f"Loading tie-up rate sheets from: {tieup_dir}")
+    logger.info(f"📁 Loading tie-up rate sheets from: {tieup_dir}")
+    
+    # Validate tie-up directory exists
+    import os.path
+    if not os.path.exists(tieup_dir):
+        logger.error(f"❌ Tie-up directory not found: {tieup_dir}")
+        logger.error("   API will start but verification will fail")
+        logger.error("   Please ensure backend/data/tieups/ exists in deployment")
     
     try:
         verifier.initialize()
-        logger.info("✅ Bill Verifier initialized successfully")
+        # Count loaded hospitals
+        hospital_count = len(verifier.matcher._rate_sheets) if hasattr(verifier.matcher, '_rate_sheets') else 0
+        logger.info("=" * 80)
+        logger.info(f"✅ Bill Verifier initialized successfully ({hospital_count} hospitals)")
+        logger.info("=" * 80)
     except Exception as e:
+        logger.error("=" * 80)
         logger.error(f"❌ Failed to initialize verifier: {e}")
-        logger.warning("API will start but verification will fail until tie-ups are loaded")
+        logger.error("   API will start but verification will fail until tie-ups are loaded")
+        logger.error("=" * 80)
     
     yield
     
-    logger.info("Shutting down Bill Verifier API...")
+    logger.info("=" * 80)
+    logger.info("🛑 Shutting down Bill Verifier API...")
+    logger.info("=" * 80)
 
 
 # =============================================================================
@@ -383,4 +431,13 @@ def verify_bill_from_mongodb_sync(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    # Railway sets PORT automatically
+    port = int(os.getenv("PORT", "8000"))
+    logger.info(f"Starting server on port {port}")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info"
+    )
+
