@@ -55,13 +55,17 @@ async def lifespan(app: FastAPI):
     
     # Check LLM status
     enable_llm = os.getenv("ENABLE_LLM_MATCHING", "false").lower() in ("true", "1", "yes")
-    disable_ollama = os.getenv("DISABLE_OLLAMA", "true").lower() in ("true", "1", "yes")
+    hf_api_token = os.getenv("HF_API_TOKEN")
     
-    if disable_ollama or not enable_llm:
+    if not enable_llm:
         logger.info("⚠️  LLM Matching: DISABLED (using embedding similarity only)")
+    elif not hf_api_token:
+        logger.warning("⚠️  LLM Matching: DISABLED (HF_API_TOKEN not set)")
+        logger.warning("   Set HF_API_TOKEN environment variable to enable LLM matching")
     else:
-        ollama_url = os.getenv("LLM_BASE_URL", "http://localhost:11434")
-        logger.info(f"🤖 LLM Matching: ENABLED (URL: {ollama_url})")
+        logger.info("🤖 LLM Matching: ENABLED (Hugging Face Inference API)")
+        logger.info(f"   Primary model: {os.getenv('PRIMARY_LLM', 'phi3:mini')}")
+        logger.info(f"   Secondary model: {os.getenv('SECONDARY_LLM', 'qwen2.5:3b')}")
     
     # Check MongoDB status
     mongo_uri = os.getenv("MONGO_URI")

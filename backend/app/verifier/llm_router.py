@@ -1,5 +1,5 @@
 """
-LLM Router for Medical Bill Verification - LOCAL MODELS ONLY.
+LLM Router for Medical Bill Verification - HUGGING FACE INFERENCE API.
 
 This module handles LLM-based matching for borderline similarity cases.
 Uses a two-tier fallback system:
@@ -11,13 +11,13 @@ Routing Logic:
 - 0.70 <= similarity < 0.85: Use LLM for verification
 - similarity < 0.70: Auto-reject (mismatch)
 
-Supports both Ollama and vLLM runtimes.
+Uses Hugging Face Inference API (no local models required).
 
 Environment Variables:
+    HF_API_TOKEN: Hugging Face API token (REQUIRED for LLM matching)
     PRIMARY_LLM: Primary model name (default: phi3:mini)
     SECONDARY_LLM: Fallback model name (default: qwen2.5:3b)
-    LLM_RUNTIME: Runtime to use (default: ollama)
-    LLM_BASE_URL: Base URL for LLM service (default: http://localhost:11434)
+    ENABLE_LLM_MATCHING: Enable/disable LLM matching (default: false)
     LLM_TIMEOUT: Request timeout in seconds (default: 30)
     LLM_MIN_CONFIDENCE: Minimum confidence threshold (default: 0.7)
 """
@@ -39,15 +39,23 @@ logger = logging.getLogger(__name__)
 # Configuration
 # =============================================================================
 
-# LLM model names
+# LLM model names (external identifiers, kept for backward compatibility)
 DEFAULT_PRIMARY_LLM = "phi3:mini"
 DEFAULT_SECONDARY_LLM = "qwen2.5:3b"
-DEFAULT_RUNTIME = "ollama"
-DEFAULT_BASE_URL = "http://localhost:11434"
-DEFAULT_TIMEOUT = 300
+DEFAULT_TIMEOUT = 30  # Reduced from 300 for HF API
 DEFAULT_MIN_CONFIDENCE = 0.7
 
-# Similarity thresholds
+# Hugging Face Inference API configuration
+HF_API_BASE_URL = "https://api-inference.huggingface.co/models"
+
+# Internal model mapping: external name -> HuggingFace repo name
+# This mapping is INTERNAL ONLY and not exposed to external config
+MODEL_NAME_MAPPING = {
+    "phi3:mini": "microsoft/Phi-3-mini-4k-instruct",
+    "qwen2.5:3b": "Qwen/Qwen2.5-3B-Instruct",
+}
+
+# Similarity thresholds (unchanged)
 AUTO_MATCH_THRESHOLD = 0.85
 LLM_LOWER_THRESHOLD = 0.70
 
@@ -127,13 +135,13 @@ class LLMDecisionCache:
 
 class LLMRouter:
     """
-    Routes medical term matching to local LLM models.
+    Routes medical term matching to Hugging Face Inference API.
     
     Features:
     - Two-tier fallback (Phi-3 -> Qwen2.5)
     - Decision caching to minimize LLM calls
     - Strict JSON-only prompts for deterministic output
-    - Supports Ollama and vLLM runtimes
+    - Uses HuggingFace Inference API (no local models)
     """
     
     # Strict prompt template for medical term matching
@@ -157,30 +165,29 @@ No explanations. No extra text."""
         self,
         primary_model: Optional[str] = None,
         secondary_model: Optional[str] = None,
-        runtime: Optional[str] = None,
-        base_url: Optional[str] = None,
+        hf_api_token: Optional[str] = None,
         timeout: Optional[int] = None,
         min_confidence: Optional[float] = None,
     ):
         """
-        Initialize the LLM router.
+        Initialize the LLM router with Hugging Face Inference API.
         
         Args:
-            primary_model: Primary LLM model name
-            secondary_model: Fallback LLM model name
-            runtime: Runtime to use ('ollama' or 'vllm' or 'disabled')
-            base_url: Base URL for LLM service
-            timeout: Request timeout in seconds
-            min_confidence: Minimum confidence threshold
+            primary_model: Primary LLM model name (default: phi3:mini)
+            secondary_model: Fallback LLM model name (default: qwen2.5:3b)
+            hf_api_token: Hugging Face API token (reads from HF_API_TOKEN env var if None)
+            timeout: Request timeout in seconds (default: 30)
+            min_confidence: Minimum confidence threshold (default: 0.7)
         """
-        # Check if LLM matching is enabled (Railway: default to FALSE)
+        # Check if LLM matching is enabled
         enable_llm = os.getenv("ENABLE_LLM_MATCHING", "false").lower() in ("true", "1", "yes")
-        disable_ollama = os.getenv("DISABLE_OLLAMA", "true").lower() in ("true", "1", "yes")
         
+        # Get HF API token from parameter or environment
+        self.hf_api_token = hf_api_token or os.getenv("HF_API_TOKEN")
+        
+        # Model configuration (external names)
         self.primary_model = primary_model or os.getenv("PRIMARY_LLM", DEFAULT_PRIMARY_LLM)
         self.secondary_model = secondary_model or os.getenv("SECONDARY_LLM", DEFAULT_SECONDARY_LLM)
-        self.runtime = runtime or os.getenv("LLM_RUNTIME", DEFAULT_RUNTIME)
-        self.base_url = base_url or os.getenv("LLM_BASE_URL", DEFAULT_BASE_URL)
         self.timeout = timeout or int(os.getenv("LLM_TIMEOUT", str(DEFAULT_TIMEOUT)))
         self.min_confidence = min_confidence or float(os.getenv("LLM_MIN_CONFIDENCE", str(DEFAULT_MIN_CONFIDENCE)))
         
@@ -195,136 +202,313 @@ No explanations. No extra text."""
         # Check if LLM is available
         self._llm_available = False
         
-        if disable_ollama or not enable_llm or self.runtime == "disabled":
+        if not enable_llm:
             logger.info("⚠️  LLM Matching: DISABLED")
-            logger.info("   Reason: ENABLE_LLM_MATCHING=false or DISABLE_OLLAMA=true")
+            logger.info("   Reason: ENABLE_LLM_MATCHING=false")
+            logger.info("   Verification will use embedding similarity only")
+            self._llm_available = False
+        elif not self.hf_api_token:
+            logger.warning("⚠️  LLM Matching: DISABLED")
+            logger.warning("   Reason: HF_API_TOKEN not set")
+            logger.warning("   Set HF_API_TOKEN environment variable to enable LLM matching")
             logger.info("   Verification will use embedding similarity only")
             self._llm_available = False
         else:
-            # Test LLM connectivity
-            self._llm_available = self._test_llm_connection()
+            # Test HF API connectivity
+            self._llm_available = self._test_hf_connection()
             
             if self._llm_available:
                 logger.info(
-                    f"✅ LLMRouter initialized: primary={self.primary_model}, "
-                    f"secondary={self.secondary_model}, runtime={self.runtime}, "
-                    f"base_url={self.base_url}"
+                    f"✅ LLMRouter initialized with Hugging Face Inference API"
+                )
+                logger.info(
+                    f"   Primary: {self.primary_model} -> {self._get_hf_model_name(self.primary_model)}"
+                )
+                logger.info(
+                    f"   Secondary: {self.secondary_model} -> {self._get_hf_model_name(self.secondary_model)}"
                 )
             else:
                 logger.warning(
-                    f"⚠️  LLM service not reachable at {self.base_url}. "
+                    f"⚠️  Hugging Face API not reachable or token invalid. "
                     f"LLM-based matching will be disabled. "
                     f"Verification will continue with embedding similarity only."
                 )
     
-    def _test_llm_connection(self) -> bool:
-        """Test if LLM service is available.
-        
-        Returns:
-            True if LLM is reachable, False otherwise
-        """
-        try:
-            import requests
-            if self.runtime == "ollama":
-                # Test Ollama health endpoint
-                response = requests.get(f"{self.base_url}/api/tags", timeout=2)
-                return response.status_code == 200
-            else:
-                # For other runtimes, assume available
-                return True
-        except Exception as e:
-            logger.debug(f"LLM health check failed: {e}")
-            return False
     
-    def _call_ollama(self, model: str, prompt: str) -> Tuple[Optional[str], Optional[str]]:
+    def _get_hf_model_name(self, external_name: str) -> str:
         """
-        Call Ollama API.
+        Map external model name to Hugging Face repo name.
+        
+        This is an INTERNAL mapping only. External config still uses
+        the same model names (phi3:mini, qwen2.5:3b).
         
         Args:
-            model: Model name
+            external_name: External model identifier (e.g., "phi3:mini")
+            
+        Returns:
+            Hugging Face model repo name (e.g., "microsoft/Phi-3-mini-4k-instruct")
+        """
+        return MODEL_NAME_MAPPING.get(external_name, external_name)
+    
+    def _test_hf_connection(self) -> bool:
+        """
+        Test if Hugging Face Inference API is available and token is valid.
+        
+        Uses a minimal POST request to verify:
+        1. Token is present
+        2. Token is valid (not expired/revoked)
+        3. Model is accessible via Inference API
+        4. API is reachable
+        
+        Returns:
+            True if HF API is reachable and token is valid, False otherwise
+        """
+        if not self.hf_api_token:
+            logger.warning("❌ HF_API_TOKEN not set - LLM matching disabled")
+            logger.warning("   Set HF_API_TOKEN environment variable to enable LLM matching")
+            return False
+        
+        # Validate token format
+        if not self.hf_api_token.startswith("hf_"):
+            logger.error("❌ HF_API_TOKEN has invalid format (should start with 'hf_')")
+            logger.error(f"   Current token starts with: {self.hf_api_token[:10]}...")
+            return False
+            
+        try:
+            # Test with primary model using a minimal inference request
+            hf_model_name = self._get_hf_model_name(self.primary_model)
+            url = f"{HF_API_BASE_URL}/{hf_model_name}"
+            
+            logger.info(f"🔍 Testing HuggingFace Inference API connection...")
+            logger.info(f"   Model: {self.primary_model} -> {hf_model_name}")
+            logger.info(f"   URL: {url}")
+            logger.info(f"   Token: {self.hf_api_token[:10]}...{self.hf_api_token[-4:]}")
+            
+            headers = {
+                "Authorization": f"Bearer {self.hf_api_token}",
+                "Content-Type": "application/json",
+            }
+            
+            # Minimal test payload (empty prompt to minimize processing)
+            # HF Inference API requires POST, not GET
+            test_payload = {
+                "inputs": "test",
+                "parameters": {
+                    "max_new_tokens": 1,  # Minimal generation
+                    "return_full_text": False,
+                }
+            }
+            
+            # Quick health check with short timeout
+            logger.debug(f"   Sending POST request with test payload...")
+            response = requests.post(url, headers=headers, json=test_payload, timeout=10)
+            
+            logger.debug(f"   Response status: {response.status_code}")
+            
+            # Handle different response codes
+            if response.status_code == 200:
+                logger.info("✅ HuggingFace API connection successful!")
+                logger.info(f"   Model {hf_model_name} is ready")
+                return True
+                
+            elif response.status_code == 503:
+                # Model is loading - this is OK, token is valid
+                try:
+                    error_data = response.json()
+                    estimated_time = error_data.get("estimated_time", "unknown")
+                    logger.info(f"✅ HuggingFace API token is valid")
+                    logger.info(f"⏳ Model {hf_model_name} is loading (estimated: {estimated_time}s)")
+                    logger.info(f"   This is normal for first request - subsequent calls will be fast")
+                    return True
+                except:
+                    logger.info(f"✅ HuggingFace API token is valid (model loading)")
+                    return True
+                    
+            elif response.status_code == 401:
+                logger.error("❌ HuggingFace API authentication failed")
+                logger.error("   Token is invalid, expired, or revoked")
+                logger.error("   Get a new token from: https://huggingface.co/settings/tokens")
+                return False
+                
+            elif response.status_code == 403:
+                logger.error("❌ HuggingFace API access forbidden")
+                logger.error(f"   You may not have access to model: {hf_model_name}")
+                logger.error("   Note: This model should be public - check HuggingFace status")
+                return False
+                
+            elif response.status_code == 404:
+                logger.error("❌ Model not found on HuggingFace")
+                logger.error(f"   Model: {hf_model_name}")
+                logger.error("   Check MODEL_NAME_MAPPING in llm_router.py")
+                return False
+                
+            elif response.status_code == 429:
+                logger.warning("⚠️  HuggingFace API rate limit exceeded")
+                logger.warning("   Free tier: ~10 requests/minute")
+                logger.warning("   LLM matching will be disabled temporarily")
+                return False
+                
+            else:
+                logger.error(f"❌ HuggingFace API returned unexpected status: {response.status_code}")
+                try:
+                    error_detail = response.json()
+                    logger.error(f"   Error details: {error_detail}")
+                except:
+                    logger.error(f"   Response text: {response.text[:200]}")
+                return False
+            
+        except requests.exceptions.Timeout:
+            logger.error("❌ HuggingFace API connection timeout")
+            logger.error("   Check your internet connection")
+            logger.error("   HuggingFace API may be experiencing issues")
+            return False
+            
+        except requests.exceptions.ConnectionError as e:
+            logger.error("❌ Cannot connect to HuggingFace API")
+            logger.error(f"   Error: {str(e)[:100]}")
+            logger.error("   Check your internet connection")
+            logger.error("   Check if https://api-inference.huggingface.co is accessible")
+            return False
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ HuggingFace API request failed: {type(e).__name__}")
+            logger.error(f"   Error: {str(e)[:200]}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ Unexpected error during HuggingFace API health check")
+            logger.error(f"   Error type: {type(e).__name__}")
+            logger.error(f"   Error message: {str(e)[:200]}")
+            import traceback
+            logger.debug(f"   Traceback: {traceback.format_exc()}")
+            return False
+    
+    def _call_huggingface(self, model: str, prompt: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Call Hugging Face Inference API.
+        
+        Args:
+            model: External model name (e.g., "phi3:mini")
             prompt: Prompt text
             
         Returns:
             Tuple of (response text, error message)
         """
-        url = f"{self.base_url}/api/generate"
+        # Map external model name to HF repo name
+        hf_model_name = self._get_hf_model_name(model)
+        url = f"{HF_API_BASE_URL}/{hf_model_name}"
+        
+        logger.debug(f"Calling HuggingFace API: {model} -> {hf_model_name}")
+        
+        headers = {
+            "Authorization": f"Bearer {self.hf_api_token}",
+            "Content-Type": "application/json",
+        }
+        
         payload = {
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
+            "inputs": prompt,
+            "parameters": {
                 "temperature": 0.1,  # Low temperature for deterministic output
-                "num_predict": 150,  # Limit output length
+                "max_new_tokens": 150,  # Limit output length
+                "return_full_text": False,  # Only return generated text
             }
         }
         
         try:
-            response = requests.post(url, json=payload, timeout=self.timeout)
-            response.raise_for_status()
+            logger.debug(f"Sending POST request to {url}")
+            response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
             
+            logger.debug(f"Response status: {response.status_code}")
+            
+            # Handle authentication errors
+            if response.status_code == 401:
+                error_msg = f"Authentication failed for {model} - token may be invalid or expired"
+                logger.error(f"❌ {error_msg}")
+                return None, error_msg
+            
+            # Handle rate limiting
+            if response.status_code == 429:
+                error_msg = f"Rate limit exceeded for {model}"
+                logger.warning(f"⚠️  {error_msg}")
+                return None, error_msg
+            
+            # Handle model loading (HF API returns 503 when model is loading)
+            if response.status_code == 503:
+                try:
+                    error_data = response.json()
+                    estimated_time = error_data.get("estimated_time", "unknown")
+                    error_msg = f"Model {model} is loading (estimated time: {estimated_time}s)"
+                    logger.info(f"⏳ {error_msg}")
+                    return None, error_msg
+                except:
+                    error_msg = f"Model {model} is loading"
+                    logger.info(f"⏳ {error_msg}")
+                    return None, error_msg
+            
+            # Handle other HTTP errors
+            if response.status_code != 200:
+                try:
+                    error_detail = response.json()
+                    error_msg = f"API error for {model}: {error_detail}"
+                except:
+                    error_msg = f"API error for {model}: HTTP {response.status_code}"
+                logger.error(f"❌ {error_msg}")
+                logger.debug(f"   Response: {response.text[:200]}")
+                return None, error_msg
+            
+            # Parse successful response
             result = response.json()
-            return result.get("response", ""), None
+            logger.debug(f"Response type: {type(result)}")
+            
+            # HF API returns a list of generated texts
+            if isinstance(result, list) and len(result) > 0:
+                generated_text = result[0].get("generated_text", "")
+                logger.debug(f"Generated text length: {len(generated_text)}")
+                return generated_text, None
+            elif isinstance(result, dict) and "generated_text" in result:
+                generated_text = result["generated_text"]
+                logger.debug(f"Generated text length: {len(generated_text)}")
+                return generated_text, None
+            else:
+                error_msg = f"Unexpected response format from {model}: {type(result)}"
+                logger.error(f"❌ {error_msg}")
+                logger.debug(f"   Response: {result}")
+                return None, error_msg
             
         except requests.exceptions.Timeout:
-            return None, f"Timeout calling {model}"
+            error_msg = f"Timeout calling {model} (>{self.timeout}s)"
+            logger.error(f"❌ {error_msg}")
+            return None, error_msg
+            
+        except requests.exceptions.ConnectionError as e:
+            error_msg = f"Connection error calling {model}: {str(e)[:100]}"
+            logger.error(f"❌ {error_msg}")
+            return None, error_msg
+            
         except requests.exceptions.RequestException as e:
-            return None, f"Request failed for {model}: {e}"
+            error_msg = f"Request failed for {model}: {type(e).__name__} - {str(e)[:100]}"
+            logger.error(f"❌ {error_msg}")
+            return None, error_msg
+            
         except Exception as e:
-            return None, f"Unexpected error calling {model}: {e}"
-    
-    def _call_vllm(self, model: str, prompt: str) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Call vLLM API (OpenAI-compatible).
-        
-        Args:
-            model: Model name
-            prompt: Prompt text
-            
-        Returns:
-            Tuple of (response text, error message)
-        """
-        url = f"{self.base_url}/v1/completions"
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "temperature": 0.1,
-            "max_tokens": 150,
-        }
-        
-        try:
-            response = requests.post(url, json=payload, timeout=self.timeout)
-            response.raise_for_status()
-            
-            result = response.json()
-            choices = result.get("choices", [])
-            if choices:
-                return choices[0].get("text", ""), None
-            return None, "No response from vLLM"
-            
-        except requests.exceptions.Timeout:
-            return None, f"Timeout calling {model}"
-        except requests.exceptions.RequestException as e:
-            return None, f"Request failed for {model}: {e}"
-        except Exception as e:
-            return None, f"Unexpected error calling {model}: {e}"
+            error_msg = f"Unexpected error calling {model}: {type(e).__name__} - {str(e)[:100]}"
+            logger.error(f"❌ {error_msg}")
+            import traceback
+            logger.debug(f"   Traceback: {traceback.format_exc()}")
+            return None, error_msg
     
     def _call_llm(self, model: str, prompt: str) -> Tuple[Optional[str], Optional[str]]:
         """
-        Call LLM based on configured runtime.
+        Call LLM via Hugging Face Inference API.
         
         Args:
-            model: Model name
+            model: External model name (e.g., "phi3:mini")
             prompt: Prompt text
             
         Returns:
             Tuple of (response text, error message)
         """
-        if self.runtime == "ollama":
-            return self._call_ollama(model, prompt)
-        elif self.runtime == "vllm":
-            return self._call_vllm(model, prompt)
-        else:
-            return None, f"Unsupported runtime: {self.runtime}"
+        return self._call_huggingface(model, prompt)
     
     def _parse_llm_response(self, response_text: str, model: str) -> LLMMatchResult:
         """
