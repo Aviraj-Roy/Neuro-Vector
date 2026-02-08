@@ -46,7 +46,8 @@ DEFAULT_TIMEOUT = 30  # Reduced from 300 for HF API
 DEFAULT_MIN_CONFIDENCE = 0.7
 
 # Hugging Face Inference API configuration
-HF_API_BASE_URL = "https://api-inference.huggingface.co/models"
+# Updated to new router-based endpoint (Feb 2026)
+HF_API_BASE_URL = "https://router.huggingface.co/hf-inference/models"
 
 # Internal model mapping: external name -> HuggingFace repo name
 # This mapping is INTERNAL ONLY and not exposed to external config
@@ -367,7 +368,7 @@ No explanations. No extra text."""
             logger.error("❌ Cannot connect to HuggingFace API")
             logger.error(f"   Error: {str(e)[:100]}")
             logger.error("   Check your internet connection")
-            logger.error("   Check if https://api-inference.huggingface.co is accessible")
+            logger.error("   Check if https://router.huggingface.co is accessible")
             return False
             
         except requests.exceptions.RequestException as e:
