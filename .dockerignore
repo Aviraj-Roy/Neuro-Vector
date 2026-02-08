@@ -1,0 +1,96 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.coveragerc
+
+# Documentation (IMPORTANT - saves lots of space)
+*.md
+!README.md
+!backend/README.md
+docs/
+PHASE_*.md
+RAILWAY_*.md
+RENDER_*.md
+IMPLEMENTATION_*.md
+REFACTORING_*.md
+DIAGNOSIS_*.md
+EMBEDDING_*.md
+FIX_*.md
+HOSPITAL_*.md
+ITEM_*.md
+MATCHER_*.md
+MIGRATION_*.md
+MODEL_*.md
+MONGODB_*.md
+PARTIAL_*.md
+QUICK_*.md
+REPRODUCIBLE_*.md
+SYSTEM_*.md
+TESTING_*.md
+TIEUP_*.md
+VERIFIER_*.md
+
+# PDF files (test data - don't need in production)
+*.pdf
+Apollo.pdf
+Apollo\ Bill.pdf
+J_Bill.pdf
+M_Bill.pdf
+T_Bill.pdf
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Local data
+backend/uploads/
+backend/data/embedding_cache.json
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Railway/Render config (not needed in container)
+railway.json
+.railwayignore
+Procfile
+
+# Test files
+test_*.py
+*_test.py
+tests/
+
+# Logs
+*.log
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Misc
+.DS_Store
+.env.example
