@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
@@ -140,6 +140,28 @@ class DeleteBillResponse(BaseModel):
     message: str
 
 
+class BillDetailResponse(BaseModel):
+    billId: str = Field(..., description="Bill identifier (same as upload_id)")
+    upload_id: str = Field(..., description="Upload identifier")
+    status: str = Field(..., description="Current processing status")
+    hospital_name: Optional[str] = Field(
+        None,
+        description="Hospital name metadata (if available)",
+    )
+    verificationResult: str = Field(
+        ...,
+        description="Raw formatted verification text for frontend parsing",
+    )
+    formatVersion: str = Field(
+        "v1",
+        description="Verification result text format version",
+    )
+    financial_totals: dict[str, float] = Field(
+        default_factory=dict,
+        description="DB-backed verification financial totals",
+    )
+
+
 def _is_valid_upload_id(upload_id: str) -> bool:
     """Accept canonical UUID and legacy 32-char hex IDs."""
     if not upload_id or not isinstance(upload_id, str):
@@ -150,6 +172,143 @@ def _is_valid_upload_id(upload_id: str) -> bool:
     except (ValueError, TypeError, AttributeError):
         pass
     return bool(re.fullmatch(r"[0-9a-fA-F]{32}", upload_id))
+
+
+def _normalize_status(raw_status: Any) -> str:
+    status_mapping = {
+        "uploaded": "uploaded",
+        "complete": "completed",
+        "completed": "completed",
+        "success": "completed",
+        "processing": "processing",
+        "pending": "pending",
+        "failed": "failed",
+        "error": "failed",
+        "verified": "verified",
+    }
+    normalized = str(raw_status or "").strip().lower()
+    return status_mapping.get(normalized, normalized or "completed")
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_money(value: Any, *, na_when_zero: bool = False) -> str:
+    amount = _as_float(value, 0.0)
+    if na_when_zero and abs(amount) < 1e-9:
+        return "N/A"
+    return f"{amount:.2f}"
+
+
+def _format_verification_result_text(verification_result: dict[str, Any]) -> str:
+    """
+    Stable parser-oriented rendering contract (v1).
+
+    Required labels for frontend parser:
+    - Overall Summary
+    - Financial Summary
+    - Category: <name>
+    - Per-item keys:
+      Bill Item, Best Match, Similarity, Allowed, Billed, Extra, Decision, Reason
+    """
+    if not isinstance(verification_result, dict):
+        return ""
+
+    lines: list[str] = []
+
+    green_count = int(verification_result.get("green_count", 0) or 0)
+    red_count = int(verification_result.get("red_count", 0) or 0)
+    unclassified_count = int(verification_result.get("unclassified_count", 0) or 0)
+    mismatch_count = int(verification_result.get("mismatch_count", 0) or 0)
+    allowed_not_comparable_count = int(
+        verification_result.get("allowed_not_comparable_count", 0) or 0
+    )
+    total_items = (
+        green_count
+        + red_count
+        + unclassified_count
+        + mismatch_count
+        + allowed_not_comparable_count
+    )
+
+    lines.append("Overall Summary")
+    lines.append(f"Total Items: {total_items}")
+    lines.append(f"GREEN: {green_count}")
+    lines.append(f"RED: {red_count}")
+    lines.append(f"UNCLASSIFIED: {unclassified_count}")
+    lines.append(f"MISMATCH: {mismatch_count}")
+    lines.append(f"ALLOWED_NOT_COMPARABLE: {allowed_not_comparable_count}")
+    lines.append("")
+
+    lines.append("Financial Summary")
+    lines.append(f"Total Bill Amount: {_format_money(verification_result.get('total_bill_amount'))}")
+    lines.append(
+        f"Total Allowed Amount: {_format_money(verification_result.get('total_allowed_amount'))}"
+    )
+    lines.append(f"Total Extra Amount: {_format_money(verification_result.get('total_extra_amount'))}")
+    lines.append(
+        f"Total Unclassified Amount: {_format_money(verification_result.get('total_unclassified_amount'))}"
+    )
+    lines.append("")
+
+    results = verification_result.get("results") or []
+    if not isinstance(results, list):
+        return "\n".join(lines).strip()
+
+    for category_result in results:
+        if not isinstance(category_result, dict):
+            continue
+        category_name = str(category_result.get("category") or "unknown")
+        lines.append(f"Category: {category_name}")
+
+        items = category_result.get("items") or []
+        if not isinstance(items, list):
+            items = []
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            diagnostics = item.get("diagnostics") or {}
+            if not isinstance(diagnostics, dict):
+                diagnostics = {}
+
+            best_match = (
+                item.get("matched_item")
+                or diagnostics.get("best_candidate")
+                or "N/A"
+            )
+            similarity_score = item.get("similarity_score")
+            similarity_text = (
+                f"{_as_float(similarity_score) * 100:.2f}%"
+                if similarity_score is not None
+                else "N/A"
+            )
+            decision = str(item.get("status") or "unknown")
+            reason = diagnostics.get("failure_reason")
+            if not reason:
+                reason = "Match within allowed limit" if decision == "green" else "N/A"
+
+            lines.append(f"Bill Item: {item.get('bill_item') or 'N/A'}")
+            lines.append(f"Best Match: {best_match}")
+            lines.append(f"Similarity: {similarity_text}")
+            lines.append(
+                f"Allowed: {_format_money(item.get('allowed_amount'), na_when_zero=decision in {'unclassified', 'mismatch', 'allowed_not_comparable'})}"
+            )
+            lines.append(f"Billed: {_format_money(item.get('bill_amount'))}")
+            lines.append(
+                f"Extra: {_format_money(item.get('extra_amount'), na_when_zero=decision in {'unclassified', 'mismatch', 'allowed_not_comparable'})}"
+            )
+            lines.append(f"Decision: {decision}")
+            lines.append(f"Reason: {reason}")
+            lines.append("")
+
+    return "\n".join(lines).strip()
 
 
 # ============================================================================
@@ -248,18 +407,7 @@ async def get_upload_status(upload_id: str):
                 file_size_bytes=None,
             )
 
-        raw_status = str(bill_doc.get("status") or "").strip().lower()
-        status_mapping = {
-            "uploaded": "uploaded",
-            "complete": "completed",
-            "completed": "completed",
-            "success": "completed",
-            "processing": "processing",
-            "pending": "pending",
-            "failed": "failed",
-            "error": "failed",
-        }
-        normalized_status = status_mapping.get(raw_status, raw_status or "completed")
+        normalized_status = _normalize_status(bill_doc.get("status"))
 
         return StatusResponse(
             upload_id=upload_id,
@@ -323,18 +471,7 @@ async def list_bills(limit: int = Query(50, ge=1, le=500, description="Maximum b
             if not upload_id:
                 continue
 
-            raw_status = str(doc.get("status") or "").strip().lower()
-            status_mapping = {
-                "uploaded": "uploaded",
-                "complete": "completed",
-                "completed": "completed",
-                "success": "completed",
-                "processing": "processing",
-                "pending": "pending",
-                "failed": "failed",
-                "error": "failed",
-            }
-            normalized_status = status_mapping.get(raw_status, raw_status or "completed")
+            normalized_status = _normalize_status(doc.get("status"))
 
             bills.append(
                 BillListItem(
@@ -400,6 +537,101 @@ async def delete_bill(upload_id: str):
 
 
 # ============================================================================
+# GET /bill/{bill_id} - Bill Details + Formatted Verification Text
+# ============================================================================
+@router.get("/bill/{bill_id}", response_model=BillDetailResponse, status_code=200)
+async def get_bill_details(bill_id: str):
+    """Fetch bill with parser-safe verification text payload for dashboard use."""
+    if not _is_valid_upload_id(bill_id):
+        raise HTTPException(status_code=400, detail="Invalid bill_id format")
+
+    try:
+        from app.db.mongo_client import MongoDBClient
+
+        db = MongoDBClient(validate_schema=False)
+        bill_doc = db.get_bill(bill_id)
+        if bill_doc and bill_doc.get("deleted_at"):
+            bill_doc = None
+
+        if not bill_doc:
+            raise HTTPException(status_code=404, detail=f"Bill not found with bill_id: {bill_id}")
+
+        upload_id = str(bill_doc.get("upload_id") or bill_doc.get("_id") or bill_id)
+        status = _normalize_status(bill_doc.get("status"))
+        hospital_name = bill_doc.get("hospital_name_metadata") or bill_doc.get("hospital_name")
+        format_version = str(bill_doc.get("verification_format_version") or "").strip() or "legacy"
+        verification_text = str(bill_doc.get("verification_result_text") or "").strip()
+        verification_result = bill_doc.get("verification_result") or {}
+        financial_totals = {
+            "total_billed": _as_float(verification_result.get("total_bill_amount"), 0.0),
+            "total_allowed": _as_float(verification_result.get("total_allowed_amount"), 0.0),
+            "total_extra": _as_float(verification_result.get("total_extra_amount"), 0.0),
+            "total_unclassified": _as_float(verification_result.get("total_unclassified_amount"), 0.0),
+        }
+
+        # Regenerate parser-safe text when:
+        # - text is missing
+        # - or legacy/non-v1 text is stored
+        if (not verification_text or format_version != "v1") and isinstance(verification_result, dict) and verification_result:
+            verification_text = _format_verification_result_text(verification_result)
+            db.save_verification_result(
+                upload_id=upload_id,
+                verification_result=verification_result,
+                verification_result_text=verification_text,
+                format_version="v1",
+            )
+            format_version = "v1"
+
+        # Backfill verification result on-demand for completed records
+        # that were extracted but never passed through /verify.
+        if not verification_text and status in {"completed", "verified"}:
+            effective_hospital_name = hospital_name
+            if effective_hospital_name:
+                try:
+                    from app.verifier.api import verify_bill_from_mongodb_sync
+
+                    verification_result = verify_bill_from_mongodb_sync(
+                        upload_id,
+                        hospital_name=effective_hospital_name,
+                    )
+                    verification_text = _format_verification_result_text(verification_result)
+                    db.save_verification_result(
+                        upload_id=upload_id,
+                        verification_result=verification_result,
+                        verification_result_text=verification_text,
+                        format_version="v1",
+                    )
+                    format_version = "v1"
+                except Exception as verify_err:
+                    logger.warning(
+                        "On-demand verification failed for upload_id=%s: %s",
+                        upload_id,
+                        verify_err,
+                    )
+            else:
+                logger.warning(
+                    "Cannot run on-demand verification for upload_id=%s: hospital name missing",
+                    upload_id,
+                )
+
+        return BillDetailResponse(
+            billId=upload_id,
+            upload_id=upload_id,
+            status=status,
+            hospital_name=hospital_name,
+            verificationResult=verification_text,
+            formatVersion=format_version,
+            financial_totals=financial_totals,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fetch bill details for {bill_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch bill details: {str(e)}")
+
+
+# ============================================================================
 # POST /verify/{upload_id} - Run Verification
 # ============================================================================
 @router.post("/verify/{upload_id}", status_code=200)
@@ -457,6 +689,13 @@ async def verify_bill(
         verification_result = verify_bill_from_mongodb_sync(
             upload_id,
             hospital_name=effective_hospital_name
+        )
+        verification_result_text = _format_verification_result_text(verification_result)
+        db.save_verification_result(
+            upload_id=upload_id,
+            verification_result=verification_result,
+            verification_result_text=verification_result_text,
+            format_version="v1",
         )
         
         logger.info(f"Verification completed for upload_id: {upload_id}")

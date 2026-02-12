@@ -362,6 +362,31 @@ class MongoDBClient:
             return None
         return self.collection.find_one({"ingestion_request_id": ingestion_request_id})
 
+    def save_verification_result(
+        self,
+        upload_id: str,
+        verification_result: Dict[str, Any],
+        verification_result_text: str,
+        format_version: str = "v1",
+    ) -> bool:
+        """Persist verification output for frontend dashboard consumption."""
+        now = datetime.now().isoformat()
+        result = self.collection.update_one(
+            {"_id": upload_id},
+            {
+                "$set": {
+                    "verification_status": "completed",
+                    "verification_result": verification_result or {},
+                    "verification_result_text": str(verification_result_text or ""),
+                    "verification_format_version": str(format_version or "v1"),
+                    "verification_updated_at": now,
+                    "updated_at": now,
+                }
+            },
+            upsert=False,
+        )
+        return result.modified_count == 1
+
     def soft_delete_upload(self, upload_id: str) -> Dict[str, Any]:
         """Soft-delete all records linked to an upload_id.
 
