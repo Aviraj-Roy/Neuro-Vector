@@ -27,9 +27,6 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import shutil
-import tempfile
-from pathlib import Path
 
 from app.db.mongo_client import MongoDBClient
 from app.verifier.models import BillInput, TieUpRateSheet, VerificationResponse
@@ -260,7 +257,8 @@ async def health_check():
 @app.post("/upload", response_model=UploadResponse, tags=["Upload"])
 async def upload_and_process_bill(
     file: UploadFile = File(..., description="PDF file of the medical bill"),
-    hospital_name: str = Form(..., description="Name of the hospital (e.g., 'Apollo Hospital', 'Fortis Hospital')")
+    hospital_name: str = Form(..., description="Name of the hospital (e.g., 'Apollo Hospital', 'Fortis Hospital')"),
+    client_request_id: Optional[str] = Form(None, description="Optional idempotency key from frontend")
 ):
     """
     Upload a PDF bill and process it with OCR and extraction.
@@ -279,77 +277,38 @@ async def upload_and_process_bill(
     Returns:
         UploadResponse with upload_id and processing details
     """
-    # Validate file type
-    if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only PDF files are accepted"
-        )
-    
-    # Validate hospital name
-    if not hospital_name or not hospital_name.strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Hospital name is required"
-        )
-    
-    # Create a temporary file to store the uploaded PDF
-    temp_pdf_path = None
     try:
-        # Save uploaded file to temporary location
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
-            shutil.copyfileobj(file.file, temp_file)
-            temp_pdf_path = temp_file.name
-        
-        logger.info(f"Processing uploaded PDF: {file.filename} for hospital: {hospital_name}")
-        
-        # Import process_bill function
-        from app.main import process_bill
-        
-        # Process the bill
-        upload_id = process_bill(
-            pdf_path=temp_pdf_path,
-            hospital_name=hospital_name.strip()
+        from app.services.upload_pipeline import handle_pdf_upload
+
+        result = await handle_pdf_upload(
+            file=file,
+            hospital_name=hospital_name,
+            client_request_id=client_request_id,
         )
-        
-        # Fetch the processed bill from MongoDB to get details
         db = MongoDBClient(validate_schema=False)
-        bill_doc = db.get_bill_by_upload_id(upload_id)
-        
-        if not bill_doc:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Bill was processed but could not be retrieved from database"
-            )
-        
-        # Extract summary information
-        total_items = sum(len(v) for v in bill_doc.get("items", {}).values())
-        page_count = bill_doc.get("page_count", 0)
-        grand_total = bill_doc.get("grand_total", 0.0)
+        bill_doc = db.get_bill_by_upload_id(result["upload_id"]) or {}
+        total_items = sum(len(v) for v in (bill_doc.get("items", {}) or {}).values())
+        page_count = bill_doc.get("page_count")
+        grand_total = bill_doc.get("grand_total")
         
         return UploadResponse(
             success=True,
-            upload_id=upload_id,
-            hospital_name=hospital_name.strip(),
-            message=f"Bill processed successfully. Use upload_id to verify.",
+            upload_id=result["upload_id"],
+            hospital_name=result["hospital_name"],
+            message=result["message"],
             page_count=page_count,
             total_items=total_items,
             grand_total=grand_total
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to process uploaded bill: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process bill: {str(e)}"
         )
-    finally:
-        # Clean up temporary file
-        if temp_pdf_path and Path(temp_pdf_path).exists():
-            try:
-                Path(temp_pdf_path).unlink()
-            except Exception as e:
-                logger.warning(f"Failed to delete temporary file {temp_pdf_path}: {e}")
 
 
 @app.get("/status/{upload_id}", response_model=StatusResponse, tags=["Upload"])
@@ -375,6 +334,7 @@ async def get_upload_status(upload_id: str):
 
         raw_status = str(bill_doc.get("status") or "").strip().lower()
         status_mapping = {
+            "uploaded": "uploaded",
             "complete": "completed",
             "completed": "completed",
             "success": "completed",

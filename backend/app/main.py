@@ -111,6 +111,7 @@ def process_bill(
     pdf_path: str, 
     hospital_name: str,  # NEW: Required parameter for hospital selection
     upload_id: str | None = None, 
+    original_filename: str | None = None,
     auto_cleanup: bool = True
 ) -> str:
     """Process a medical bill PDF and persist ONE MongoDB document.
@@ -136,6 +137,7 @@ def process_bill(
         ValueError: If hospital_name is invalid
     """
     upload_id = upload_id or uuid.uuid4().hex
+    original_filename = (original_filename or os.path.basename(pdf_path) or f"{upload_id}.pdf").strip()
     
     # Validate hospital_name parameter
     if not hospital_name or not isinstance(hospital_name, str) or not hospital_name.strip():
@@ -147,10 +149,27 @@ def process_bill(
     # Track pipeline success for cleanup decision
     ocr_success = False
     db_success = False
+    db = MongoDBClient(validate_schema=False)
+
+    # Atomic lifecycle transition to avoid duplicate processing for same upload_id.
+    acquired = db.mark_processing(upload_id)
+    if not acquired:
+        current = db.get_bill(upload_id) or {}
+        current_status = str(current.get("status") or "").lower()
+        if current_status == "completed":
+            logger.info(f"Upload already completed; skipping reprocessing: {upload_id}")
+            return upload_id
+        if current_status == "processing":
+            logger.info(f"Upload is already being processed by another worker: {upload_id}")
+            return upload_id
+        raise RuntimeError(
+            f"Cannot transition upload to processing for upload_id={upload_id}. "
+            f"Current status={current_status or 'unknown'}"
+        )
 
     try:
         # 1) Convert ALL pages to images
-        image_paths = pdf_to_images(pdf_path)
+        image_paths = pdf_to_images(pdf_path, original_pdf_name=original_filename)
         logger.info(f"Converted {len(image_paths)} pages from {pdf_path}")
 
         # 2) Preprocess ALL images
@@ -169,13 +188,15 @@ def process_bill(
         # 5) Add immutable metadata BEFORE validation
         #    (so validation sees the complete final state)
         bill_data["upload_id"] = upload_id
-        bill_data["source_pdf"] = os.path.basename(pdf_path)
+        bill_data["source_pdf"] = original_filename
+        bill_data["original_filename"] = original_filename
         bill_data["page_count"] = len(image_paths)
         bill_data.setdefault("schema_version", 2)  # Bump to v2 (hospital not in schema)
         
         # Store hospital_name as metadata (NOT in header, used for verification only)
         # This is stored at document root level for easy access during verification
         bill_data["hospital_name_metadata"] = hospital_name
+        bill_data["hospital_name"] = hospital_name
 
         # 6) Post-extraction validation on FINAL aggregated object
         #    This runs exactly ONCE per upload_id after full aggregation
@@ -194,13 +215,16 @@ def process_bill(
             f"grand_total={bill_data.get('grand_total', 0)}"
         )
 
-        # 8) Single bill-scoped upsert
-        db = MongoDBClient(validate_schema=False)
-        db.upsert_bill(upload_id, bill_data)
+        # 8) Single bill-scoped completion update (never insert here)
+        db.complete_bill(upload_id, bill_data)
         logger.info(f"Stored bill with upload_id: {upload_id}")
         db_success = True  # DB save completed successfully
 
         return upload_id
+    except Exception as e:
+        # Record processing failure in Mongo lifecycle document.
+        db.mark_failed(upload_id, str(e))
+        raise
     
     finally:
         # 9) Post-processing cleanup (runs even if exceptions occurred)
@@ -231,5 +255,5 @@ def process_bill(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    bill_id = process_bill("Apollo.pdf")
+    bill_id = process_bill("Apollo.pdf", hospital_name="UNKNOWN")
     print(f"Stored bill with upload_id: {bill_id}")

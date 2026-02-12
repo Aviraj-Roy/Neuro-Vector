@@ -16,9 +16,8 @@ Separation of Concerns:
 from __future__ import annotations
 
 import logging
-import os
+import re
 import uuid
-from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
@@ -46,7 +45,10 @@ class UploadResponse(BaseModel):
     upload_id: str = Field(..., description="Unique identifier for the uploaded bill")
     hospital_name: str = Field(..., description="Hospital name provided in the request")
     message: str = Field(..., description="Success message")
+    status: str = Field(..., description="Processing status")
     page_count: Optional[int] = Field(None, description="Number of pages in the PDF")
+    original_filename: Optional[str] = Field(None, description="Original uploaded filename")
+    file_size_bytes: Optional[int] = Field(None, description="Original uploaded PDF size in bytes")
     
     class Config:
         json_schema_extra = {
@@ -54,6 +56,9 @@ class UploadResponse(BaseModel):
                 "upload_id": "a1b2c3d4e5f6g7h8i9j0",
                 "hospital_name": "Apollo Hospital",
                 "message": "Bill uploaded and processed successfully",
+                "status": "completed",
+                "original_filename": "bill.pdf",
+                "file_size_bytes": 324567,
                 "page_count": 3
             }
         }
@@ -91,6 +96,8 @@ class StatusResponse(BaseModel):
     message: str = Field(..., description="Human-readable status message")
     hospital_name: Optional[str] = Field(None, description="Hospital name (if available)")
     page_count: Optional[int] = Field(None, description="Number of pages in the uploaded PDF")
+    original_filename: Optional[str] = Field(None, description="Original uploaded filename")
+    file_size_bytes: Optional[int] = Field(None, description="Original uploaded PDF size in bytes")
 
     class Config:
         json_schema_extra = {
@@ -100,6 +107,8 @@ class StatusResponse(BaseModel):
                 "exists": True,
                 "message": "Bill found",
                 "hospital_name": "Apollo Hospital",
+                "original_filename": "bill.pdf",
+                "file_size_bytes": 324567,
                 "page_count": 3
             }
         }
@@ -119,8 +128,28 @@ class BillListItem(BaseModel):
     status: str
     grand_total: float = 0.0
     page_count: Optional[int] = None
+    original_filename: Optional[str] = None
+    file_size_bytes: Optional[int] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+class DeleteBillResponse(BaseModel):
+    success: bool
+    upload_id: str
+    message: str
+
+
+def _is_valid_upload_id(upload_id: str) -> bool:
+    """Accept canonical UUID and legacy 32-char hex IDs."""
+    if not upload_id or not isinstance(upload_id, str):
+        return False
+    try:
+        uuid.UUID(upload_id)
+        return True
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return bool(re.fullmatch(r"[0-9a-fA-F]{32}", upload_id))
 
 
 # ============================================================================
@@ -129,7 +158,8 @@ class BillListItem(BaseModel):
 @router.post("/upload", response_model=UploadResponse, status_code=200)
 async def upload_bill(
     file: UploadFile = File(..., description="Medical bill PDF file"),
-    hospital_name: str = Form(..., description="Hospital name (e.g., 'Apollo Hospital')")
+    hospital_name: str = Form(..., description="Hospital name (e.g., 'Apollo Hospital')"),
+    client_request_id: Optional[str] = Form(None, description="Optional idempotency key from frontend")
 ):
     """
     Upload and process a medical bill PDF.
@@ -154,84 +184,35 @@ async def upload_bill(
     """
     logger.info(f"Received upload request for hospital: {hospital_name}")
     
-    # Validate file type
-    if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid file type. Only PDF files are accepted."
-        )
-    
-    # Validate hospital name
-    if not hospital_name or not hospital_name.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="hospital_name is required and cannot be empty"
-        )
-    
-    # Generate unique upload ID
-    upload_id = uuid.uuid4().hex
-    
-    # Create uploads directory if it doesn't exist
-    from app.config import UPLOADS_DIR
-    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Save uploaded file temporarily
-    pdf_path = UPLOADS_DIR / f"{upload_id}_{file.filename}"
-    
     try:
-        # Save uploaded file
-        contents = await file.read()
-        with open(pdf_path, "wb") as f:
-            f.write(contents)
-        
-        logger.info(f"Saved uploaded file: {pdf_path}")
-        
-        # Process the bill using the service layer
-        from app.main import process_bill
-        
-        result_upload_id = process_bill(
-            pdf_path=str(pdf_path),
-            hospital_name=hospital_name.strip(),
-            upload_id=upload_id,
-            auto_cleanup=True  # Clean up temporary images after processing
+        from app.services.upload_pipeline import handle_pdf_upload
+
+        result = await handle_pdf_upload(
+            file=file,
+            hospital_name=hospital_name,
+            client_request_id=client_request_id,
         )
-        
-        # Get page count from MongoDB
-        from app.db.mongo_client import MongoDBClient
-        db = MongoDBClient(validate_schema=False)
-        bill_doc = db.get_bill(result_upload_id)
-        page_count = bill_doc.get("page_count") if bill_doc else None
-        
-        logger.info(f"Successfully processed bill: {result_upload_id}")
-        
+
+        logger.info(f"Upload lifecycle completed for upload_id: {result['upload_id']}")
         return UploadResponse(
-            upload_id=result_upload_id,
-            hospital_name=hospital_name.strip(),
-            message="Bill uploaded and processed successfully",
-            page_count=page_count
+            upload_id=result["upload_id"],
+            hospital_name=result["hospital_name"],
+            message=result["message"],
+            status=result["status"],
+            page_count=result.get("page_count"),
+            original_filename=result.get("original_filename"),
+            file_size_bytes=result.get("file_size_bytes"),
         )
         
-    except ValueError as e:
-        # Validation errors from process_bill
-        logger.error(f"Validation error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-        
+    except HTTPException:
+        raise
+
     except Exception as e:
-        # Unexpected errors
         logger.error(f"Failed to process bill: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to process bill: {str(e)}"
         )
-        
-    finally:
-        # Clean up the uploaded PDF file
-        try:
-            if pdf_path.exists():
-                pdf_path.unlink()
-                logger.info(f"Cleaned up uploaded PDF: {pdf_path}")
-        except Exception as e:
-            logger.warning(f"Failed to clean up uploaded PDF: {e}")
 
 
 # ============================================================================
@@ -252,6 +233,8 @@ async def get_upload_status(upload_id: str):
 
         db = MongoDBClient(validate_schema=False)
         bill_doc = db.get_bill(upload_id)
+        if bill_doc and bill_doc.get("deleted_at"):
+            bill_doc = None
 
         if not bill_doc:
             return StatusResponse(
@@ -260,11 +243,14 @@ async def get_upload_status(upload_id: str):
                 exists=False,
                 message="Bill not found for the provided upload_id",
                 hospital_name=None,
-                page_count=None
+                page_count=None,
+                original_filename=None,
+                file_size_bytes=None,
             )
 
         raw_status = str(bill_doc.get("status") or "").strip().lower()
         status_mapping = {
+            "uploaded": "uploaded",
             "complete": "completed",
             "completed": "completed",
             "success": "completed",
@@ -281,7 +267,9 @@ async def get_upload_status(upload_id: str):
             exists=True,
             message="Bill found",
             hospital_name=bill_doc.get("hospital_name_metadata"),
-            page_count=bill_doc.get("page_count")
+            page_count=bill_doc.get("page_count"),
+            original_filename=bill_doc.get("original_filename") or bill_doc.get("source_pdf"),
+            file_size_bytes=bill_doc.get("file_size_bytes"),
         )
 
     except Exception as e:
@@ -308,7 +296,13 @@ async def list_bills(limit: int = Query(50, ge=1, le=500, description="Maximum b
 
         db = MongoDBClient(validate_schema=False)
         cursor = db.collection.find(
-            {},
+            {
+                "status": {"$in": ["completed", "complete", "success"]},
+                "upload_id": {"$exists": True, "$ne": ""},
+                "items": {"$type": "object"},
+                "grand_total": {"$exists": True},
+                "deleted_at": {"$exists": False},
+            },
             {
                 "_id": 1,
                 "upload_id": 1,
@@ -316,6 +310,8 @@ async def list_bills(limit: int = Query(50, ge=1, le=500, description="Maximum b
                 "status": 1,
                 "grand_total": 1,
                 "page_count": 1,
+                "original_filename": 1,
+                "file_size_bytes": 1,
                 "created_at": 1,
                 "updated_at": 1,
             },
@@ -329,6 +325,7 @@ async def list_bills(limit: int = Query(50, ge=1, le=500, description="Maximum b
 
             raw_status = str(doc.get("status") or "").strip().lower()
             status_mapping = {
+                "uploaded": "uploaded",
                 "complete": "completed",
                 "completed": "completed",
                 "success": "completed",
@@ -346,6 +343,8 @@ async def list_bills(limit: int = Query(50, ge=1, le=500, description="Maximum b
                     status=normalized_status,
                     grand_total=float(doc.get("grand_total") or 0.0),
                     page_count=doc.get("page_count"),
+                    original_filename=doc.get("original_filename") or doc.get("source_pdf"),
+                    file_size_bytes=doc.get("file_size_bytes"),
                     created_at=doc.get("created_at"),
                     updated_at=doc.get("updated_at"),
                 )
@@ -359,6 +358,45 @@ async def list_bills(limit: int = Query(50, ge=1, le=500, description="Maximum b
             status_code=500,
             detail=f"Failed to list bills: {str(e)}"
         )
+
+
+# ============================================================================
+# DELETE /bills/{upload_id} - Delete Bill (Idempotent)
+# ============================================================================
+@router.delete("/bills/{upload_id}", response_model=DeleteBillResponse, status_code=200)
+async def delete_bill(upload_id: str):
+    """Delete a bill/upload by upload_id with idempotent semantics."""
+    if not _is_valid_upload_id(upload_id):
+        raise HTTPException(status_code=400, detail="Invalid upload_id format")
+
+    try:
+        from app.db.mongo_client import MongoDBClient
+
+        db = MongoDBClient(validate_schema=False)
+        result = db.soft_delete_upload(upload_id)
+
+        if result["matched_total"] == 0:
+            return DeleteBillResponse(
+                success=True,
+                upload_id=upload_id,
+                message="Upload not found or already deleted",
+            )
+
+        if result["modified_count"] == 0:
+            return DeleteBillResponse(
+                success=True,
+                upload_id=upload_id,
+                message="Bill already deleted",
+            )
+
+        return DeleteBillResponse(
+            success=True,
+            upload_id=upload_id,
+            message="Bill deleted successfully",
+        )
+    except Exception as e:
+        logger.error(f"Failed to delete bill {upload_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to delete bill: {str(e)}")
 
 
 # ============================================================================
@@ -397,6 +435,8 @@ async def verify_bill(
         # Check if bill exists
         db = MongoDBClient(validate_schema=False)
         bill_doc = db.get_bill(upload_id)
+        if bill_doc and bill_doc.get("deleted_at"):
+            bill_doc = None
         
         if not bill_doc:
             raise HTTPException(

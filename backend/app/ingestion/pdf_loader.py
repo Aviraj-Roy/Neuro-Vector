@@ -5,6 +5,7 @@ Uses absolute paths to avoid CWD-dependent failures.
 """
 
 import os
+import re
 from pathlib import Path
 from typing import List
 from pdf2image import convert_from_path
@@ -12,7 +13,13 @@ from pdf2image import convert_from_path
 POPPLER_PATH = r"C:\poppler\Library\bin"
 
 
-def pdf_to_images(pdf_path: str, output_dir: str = None) -> List[str]:
+def _sanitize_stem(name: str) -> str:
+    stem = re.sub(r"\s+", "_", (name or "").strip())
+    stem = re.sub(r"[^A-Za-z0-9._-]", "", stem)
+    return stem or "uploaded_bill"
+
+
+def pdf_to_images(pdf_path: str, output_dir: str = None, original_pdf_name: str | None = None) -> List[str]:
     """Convert PDF to images with absolute path handling.
     
     Args:
@@ -79,7 +86,10 @@ def pdf_to_images(pdf_path: str, output_dir: str = None) -> List[str]:
     
     # Save images and collect absolute paths
     image_paths = []
-    base_name = os.path.splitext(os.path.basename(str(pdf_path_obj)))[0]
+    if original_pdf_name:
+        base_name = _sanitize_stem(os.path.splitext(original_pdf_name)[0])
+    else:
+        base_name = _sanitize_stem(os.path.splitext(os.path.basename(str(pdf_path_obj)))[0])
     
     for i, image in enumerate(images):
         # Use absolute path for image file

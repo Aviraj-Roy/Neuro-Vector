@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
@@ -93,6 +94,136 @@ class MongoDBClient:
         data_to_insert["inserted_at"] = datetime.now().isoformat()
         result = self.collection.insert_one(data_to_insert)
         return str(result.inserted_id)
+
+    def create_upload_record(
+        self,
+        *,
+        upload_id: str,
+        original_filename: str,
+        file_size_bytes: int,
+        hospital_name: str,
+        source_pdf: Optional[str] = None,
+        ingestion_request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create exactly one upload-scoped document for a PDF.
+
+        Returns:
+            Dict with:
+            - upload_id: stable upload identifier
+            - created: True if insert happened now, False if request is duplicate
+            - status: current status of the existing/new document
+        """
+        now = datetime.now().isoformat()
+        source_name = source_pdf or original_filename
+
+        doc: Dict[str, Any] = {
+            "_id": upload_id,
+            "upload_id": upload_id,
+            "status": "uploaded",
+            "document_type": "bill_upload",
+            "created_at": now,
+            "updated_at": now,
+            "source_pdf": source_name,
+            "original_filename": original_filename,
+            "file_size_bytes": int(file_size_bytes or 0),
+            # Keep both fields for backward compatibility with existing consumers.
+            "hospital_name_metadata": hospital_name,
+            "hospital_name": hospital_name,
+            "schema_version": 2,
+        }
+        if ingestion_request_id:
+            doc["ingestion_request_id"] = ingestion_request_id
+
+        try:
+            self.collection.insert_one(doc)
+            return {"upload_id": upload_id, "created": True, "status": "uploaded"}
+        except DuplicateKeyError:
+            existing = None
+            if ingestion_request_id:
+                existing = self.collection.find_one({"ingestion_request_id": ingestion_request_id})
+            if not existing:
+                existing = self.collection.find_one({"_id": upload_id})
+            if not existing:
+                raise
+            return {
+                "upload_id": str(existing.get("upload_id") or existing.get("_id")),
+                "created": False,
+                "status": str(existing.get("status") or "uploaded"),
+            }
+
+    def mark_processing(self, upload_id: str) -> bool:
+        """Transition uploaded/failed -> processing atomically."""
+        now = datetime.now().isoformat()
+        result = self.collection.update_one(
+            {
+                "_id": upload_id,
+                "status": {"$in": ["uploaded", "failed"]},
+            },
+            {
+                "$set": {
+                    "status": "processing",
+                    "updated_at": now,
+                    "processing_started_at": now,
+                }
+            },
+        )
+        return result.modified_count == 1
+
+    def mark_failed(self, upload_id: str, error_message: str) -> None:
+        """Mark upload as failed with error details."""
+        now = datetime.now().isoformat()
+        self.collection.update_one(
+            {"_id": upload_id},
+            {
+                "$set": {
+                    "status": "failed",
+                    "updated_at": now,
+                    "error_message": str(error_message),
+                    "processing_failed_at": now,
+                }
+            },
+        )
+
+    def complete_bill(self, upload_id: str, bill_data: Dict[str, Any]) -> str:
+        """Finalize one upload-scoped bill document using update_one only."""
+        from app.db.artifact_filter import filter_artifact_items, validate_bill_items
+
+        bill_data = filter_artifact_items(bill_data)
+        is_valid, error_msg = validate_bill_items(bill_data)
+        if not is_valid:
+            logger.error(f"Bill validation failed before completion update: {error_msg}")
+
+        data = self._validate_and_transform(bill_data)
+        now = datetime.now().isoformat()
+
+        update = {
+            "$set": {
+                "updated_at": now,
+                "status": "completed",
+                "processing_completed_at": now,
+                "page_count": data.get("page_count"),
+                "extraction_date": data.get("extraction_date"),
+                "header": data.get("header", {}) or {},
+                "patient": data.get("patient", {}) or {},
+                "items": data.get("items", {}) or {},
+                "subtotals": data.get("subtotals", {}) or {},
+                "summary": data.get("summary", {}) or {},
+                "grand_total": data.get("grand_total", 0.0),
+                "raw_ocr_text": data.get("raw_ocr_text"),
+                "schema_version": data.get("schema_version", 2),
+                # Keep both fields for compatibility.
+                "hospital_name_metadata": data.get("hospital_name_metadata"),
+                "hospital_name": data.get("hospital_name"),
+            }
+        }
+
+        # Preserve ingestion-level metadata if extraction layer provides updates.
+        source_pdf = data.get("source_pdf")
+        if source_pdf:
+            update["$set"]["source_pdf"] = source_pdf
+
+        self.collection.update_one({"_id": upload_id}, update, upsert=False)
+        return upload_id
 
     def upsert_bill(self, upload_id: str, bill_data: Dict[str, Any]) -> str:
         """Bill-scoped persistence: one upload_id -> one document.
@@ -225,6 +356,69 @@ class MongoDBClient:
 
     def get_bill_by_upload_id(self, upload_id: str) -> Optional[Dict[str, Any]]:
         return self.collection.find_one({"_id": upload_id})
+
+    def get_bill_by_request_id(self, ingestion_request_id: str) -> Optional[Dict[str, Any]]:
+        if not ingestion_request_id:
+            return None
+        return self.collection.find_one({"ingestion_request_id": ingestion_request_id})
+
+    def soft_delete_upload(self, upload_id: str) -> Dict[str, Any]:
+        """Soft-delete all records linked to an upload_id.
+
+        Behavior:
+        - Idempotent: repeated calls succeed.
+        - Marks linked records with deleted_at + status=deleted.
+        - Attempts transactional execution when supported.
+        """
+        now = datetime.now().isoformat()
+        linked_filter: Dict[str, Any] = {
+            "$or": [
+                {"_id": upload_id},
+                {"upload_id": upload_id},
+                {"parent_upload_id": upload_id},
+            ]
+        }
+        active_filter: Dict[str, Any] = {
+            "$and": [
+                linked_filter,
+                {"deleted_at": {"$exists": False}},
+            ]
+        }
+
+        update_doc = {
+            "$set": {
+                "deleted_at": now,
+                "updated_at": now,
+                "status": "deleted",
+            }
+        }
+
+        def _run(session=None) -> Dict[str, Any]:
+            matched_total = self.collection.count_documents(linked_filter, session=session)
+            modified = self.collection.update_many(active_filter, update_doc, session=session)
+            already_deleted = self.collection.count_documents(
+                {
+                    "$and": [
+                        linked_filter,
+                        {"deleted_at": {"$exists": True}},
+                    ]
+                },
+                session=session,
+            )
+            return {
+                "upload_id": upload_id,
+                "matched_total": int(matched_total),
+                "modified_count": int(modified.modified_count),
+                "already_deleted_count": int(already_deleted),
+            }
+
+        try:
+            with self.client.start_session() as session:
+                with session.start_transaction():
+                    return _run(session=session)
+        except Exception as tx_err:
+            logger.warning(f"Transaction not available for soft_delete_upload({upload_id}): {tx_err}")
+            return _run(session=None)
 
     def get_bills_by_patient_mrn(self, mrn: str) -> List[Dict[str, Any]]:
         return list(self.collection.find({"patient.mrn": mrn}))

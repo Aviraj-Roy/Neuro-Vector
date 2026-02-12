@@ -89,6 +89,17 @@ def ensure_indexes() -> None:
             keys=[("created_at", ASCENDING)],
             sparse=True,
         ),
+        IndexSpec(
+            name="idx_status_updated_at",
+            keys=[("status", ASCENDING), ("updated_at", ASCENDING)],
+            sparse=True,
+        ),
+        IndexSpec(
+            name="idx_ingestion_request_id_unique",
+            keys=[("ingestion_request_id", ASCENDING)],
+            unique=True,
+            sparse=True,
+        ),
     ]
 
     existing = list(col.list_indexes())
