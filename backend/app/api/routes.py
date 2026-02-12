@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -110,6 +110,17 @@ class TieupHospital(BaseModel):
     name: str
     file_path: str
     total_items: int
+
+
+class BillListItem(BaseModel):
+    """Summary model for GET /bills list endpoint."""
+    upload_id: str
+    hospital_name: Optional[str] = None
+    status: str
+    grand_total: float = 0.0
+    page_count: Optional[int] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
 
 
 # ============================================================================
@@ -278,6 +289,75 @@ async def get_upload_status(upload_id: str):
         raise HTTPException(
             status_code=500,
             detail=f"Failed to fetch status: {str(e)}"
+        )
+
+
+# ============================================================================
+# GET /bills - List Uploaded Bills (Frontend compatibility)
+# ============================================================================
+@router.get("/bills", response_model=list[BillListItem], status_code=200)
+async def list_bills(limit: int = Query(50, ge=1, le=500, description="Maximum bills to return")):
+    """
+    List recent uploaded bills.
+
+    This endpoint exists for frontend compatibility where UI screens poll
+    GET /bills to render upload history.
+    """
+    try:
+        from app.db.mongo_client import MongoDBClient
+
+        db = MongoDBClient(validate_schema=False)
+        cursor = db.collection.find(
+            {},
+            {
+                "_id": 1,
+                "upload_id": 1,
+                "hospital_name_metadata": 1,
+                "status": 1,
+                "grand_total": 1,
+                "page_count": 1,
+                "created_at": 1,
+                "updated_at": 1,
+            },
+        ).sort("updated_at", -1).limit(limit)
+
+        bills: list[BillListItem] = []
+        for doc in cursor:
+            upload_id = str(doc.get("upload_id") or doc.get("_id") or "")
+            if not upload_id:
+                continue
+
+            raw_status = str(doc.get("status") or "").strip().lower()
+            status_mapping = {
+                "complete": "completed",
+                "completed": "completed",
+                "success": "completed",
+                "processing": "processing",
+                "pending": "pending",
+                "failed": "failed",
+                "error": "failed",
+            }
+            normalized_status = status_mapping.get(raw_status, raw_status or "completed")
+
+            bills.append(
+                BillListItem(
+                    upload_id=upload_id,
+                    hospital_name=doc.get("hospital_name_metadata"),
+                    status=normalized_status,
+                    grand_total=float(doc.get("grand_total") or 0.0),
+                    page_count=doc.get("page_count"),
+                    created_at=doc.get("created_at"),
+                    updated_at=doc.get("updated_at"),
+                )
+            )
+
+        return bills
+
+    except Exception as e:
+        logger.error(f"Failed to list bills: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to list bills: {str(e)}"
         )
 
 

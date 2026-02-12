@@ -128,6 +128,7 @@ async def root():
         "health": "/health",
         "endpoints": {
             "upload": "POST /upload",
+            "bills": "GET /bills",
             "status": "GET /status/{upload_id}",
             "verify": "POST /verify/{upload_id}",
             "tieups": "GET /tieups"
