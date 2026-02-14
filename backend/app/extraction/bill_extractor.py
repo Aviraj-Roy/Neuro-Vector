@@ -294,7 +294,12 @@ VALUE_VALIDATORS = {
     "billing_date": {
         "min_len": 8,
         "max_len": 30,
-        "valid_patterns": [r"\d{2}[-/]\d{2}[-/]\d{4}", r"\d{4}[-/]\d{2}[-/]\d{2}"],
+        "valid_patterns": [
+            r"\d{2}[-/.]\d{2}[-/.]\d{2,4}",
+            r"\d{4}[-/.]\d{2}[-/.]\d{2}",
+            r"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}",
+            r"[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{2,4}",
+        ],
     },
     "bill_number": {
         "min_len": 5,
@@ -365,6 +370,9 @@ class HeaderAggregator:
         ]
         if any(re.match(p, v_upper) for p in garbage_patterns):
             return True
+        # billing_date values are typically numeric and should not require alphabetic chars.
+        if field == "billing_date":
+            return len(v) < 6
         # very short non-alphabetic
         if len(v) < 2 or not re.search(r"[A-Za-z]", v):
             return True
@@ -415,9 +423,12 @@ LABEL_PATTERNS = {
         r"invoice\s*number\s*[:.]?",
     ],
     "billing_date": [
-        r"billing\s*date\s*[:.]?",
-        r"bill\s*date\s*[:.]?",
-        r"invoice\s*date\s*[:.]?",
+        r"billing\s*(?:date|dt)\s*[:.]?",
+        r"bill\s*(?:date|dt)\s*[:.]?",
+        r"invoice\s*(?:date|dt)\s*[:.]?",
+        r"inv\s*(?:date|dt)\s*[:.]?",
+        r"date\s*of\s*invoice\s*[:.]?",
+        r"dated\s*[:.]?",
         r"date\s*[:.]?\s*(?=\d)",
     ],
 }
@@ -440,6 +451,66 @@ NAME_FALLBACK_PATTERNS = [
 def _normalize_ws(s: str) -> str:
     """Normalize whitespace in a string."""
     return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _extract_and_normalize_date(text: str) -> Optional[str]:
+    """Extract a date token from OCR text and normalize to YYYY-MM-DD."""
+    if not text:
+        return None
+
+    candidate_patterns = [
+        r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b",
+        r"\b\d{4}[./-]\d{1,2}[./-]\d{1,2}\b",
+        r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}\b",
+        r"\b[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{2,4}\b",
+    ]
+
+    token = None
+    for pat in candidate_patterns:
+        m = re.search(pat, text)
+        if m:
+            token = m.group(0).strip()
+            break
+    if not token:
+        return None
+
+    normalized_token = re.sub(r"[.]", "-", token)
+    normalized_token = re.sub(r"\s+", " ", normalized_token).strip()
+
+    formats = [
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%d-%m-%y",
+        "%d/%m/%y",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d %b %Y",
+        "%d %B %Y",
+        "%d %b %y",
+        "%d %B %y",
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%b %d %Y",
+        "%B %d %Y",
+        "%b %d, %y",
+        "%B %d, %y",
+        "%b %d %y",
+        "%B %d %y",
+    ]
+
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(normalized_token, fmt)
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def _is_date_like_text(text: str) -> bool:
+    if not text:
+        return False
+    return _extract_and_normalize_date(text) is not None
 
 
 def _make_id(prefix: str, parts: List[str]) -> str:
@@ -502,8 +573,8 @@ class HeaderParser:
                 # Skip payment zone lines for header extraction
                 continue
 
-            # Skip lines that look like items (have amounts at end)
-            if re.search(r"[\d,]+\.\d{2}\s*$", text):
+            # Skip lines that look like item rows (amount at end), but keep date-like lines.
+            if re.search(r"[\d,]+\.\d{2}\s*$", text) and not _is_date_like_text(text):
                 continue
 
             # Get next line for multi-line extraction support
@@ -578,6 +649,11 @@ class HeaderParser:
             # Safely extract the value group
             raw_value = safe_group(match, 1, "")
             cleaned_value = clean_extracted_value(raw_value)
+
+            if field == "billing_date":
+                normalized_date = _extract_and_normalize_date(cleaned_value or text)
+                if normalized_date:
+                    return normalized_date
             
             # If we got a meaningful value, return it
             if len(cleaned_value) >= 2:  # Minimum 2 chars to be valid
@@ -588,6 +664,10 @@ class HeaderParser:
                 next_text = (next_line.get("text") or "").strip()
                 multi_line_value = extract_from_next_line(text, next_text, [pat])
                 if multi_line_value:
+                    if field == "billing_date":
+                        normalized_date = _extract_and_normalize_date(multi_line_value)
+                        if normalized_date:
+                            return normalized_date
                     return multi_line_value
             
             # Pattern matched but couldn't extract value - stop trying other patterns
@@ -634,8 +714,8 @@ class HeaderParser:
             if zone == "payment":
                 continue
 
-            # Skip lines with amounts
-            if re.search(r"[\d,]+\.\d{2}\s*$", text):
+            # Skip lines with trailing amounts, but not date-like lines.
+            if re.search(r"[\d,]+\.\d{2}\s*$", text) and not _is_date_like_text(text):
                 continue
 
             # Try fallback patterns

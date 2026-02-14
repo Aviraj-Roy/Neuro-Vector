@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from pymongo import ASCENDING
+from pymongo import ASCENDING, DESCENDING
 
 from app.db.mongo_client import MongoDBClient
 
@@ -92,6 +92,26 @@ def ensure_indexes() -> None:
         IndexSpec(
             name="idx_status_updated_at",
             keys=[("status", ASCENDING), ("updated_at", ASCENDING)],
+            sparse=True,
+        ),
+        IndexSpec(
+            name="idx_is_deleted",
+            keys=[("is_deleted", ASCENDING)],
+            sparse=True,
+        ),
+        IndexSpec(
+            name="idx_hospital_name_metadata",
+            keys=[("hospital_name_metadata", ASCENDING)],
+            sparse=True,
+        ),
+        IndexSpec(
+            name="idx_upload_date",
+            keys=[("upload_date", ASCENDING)],
+            sparse=True,
+        ),
+        IndexSpec(
+            name="idx_is_deleted_upload_date_desc",
+            keys=[("is_deleted", ASCENDING), ("upload_date", DESCENDING)],
             sparse=True,
         ),
         IndexSpec(

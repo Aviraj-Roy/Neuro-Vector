@@ -119,3 +119,41 @@ console.log(verification.verification_summary);
 - **CORS:** Already enabled for local development
 - **Port:** Backend runs on 8001, frontend can run on any other port
 - **MongoDB:** Must be running before starting backend
+
+---
+
+## Bills Dashboard Scopes
+
+### GET /bills
+List dashboard bills by scope.
+
+Query params:
+- `scope=active|deleted` (default `active`)
+- `status=PENDING|PROCESSING|COMPLETED` (optional)
+- `hospital_name` (optional, case-insensitive exact match)
+- `date_filter=TODAY|YESTERDAY|THIS_MONTH|LAST_MONTH` (optional, server timezone)
+
+### GET /bills/deleted
+Shortcut endpoint for deleted scope with same optional filters.
+
+### DELETE /bills/{bill_id}
+- Soft delete by default (`permanent=false`)
+- Permanent delete with `permanent=true` (only allowed after soft delete)
+
+### POST /bills/{bill_id}/restore
+Restore a soft-deleted bill back to active scope.
+
+Example soft delete:
+```bash
+curl -X DELETE "http://localhost:8001/bills/<bill_id>"
+```
+
+Example restore:
+```bash
+curl -X POST "http://localhost:8001/bills/<bill_id>/restore"
+```
+
+Example permanent delete:
+```bash
+curl -X DELETE "http://localhost:8001/bills/<bill_id>?permanent=true"
+```

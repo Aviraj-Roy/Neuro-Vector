@@ -102,6 +102,8 @@ class MongoDBClient:
         original_filename: str,
         file_size_bytes: int,
         hospital_name: str,
+        employee_id: str,
+        invoice_date: Optional[str] = None,
         source_pdf: Optional[str] = None,
         ingestion_request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -120,17 +122,25 @@ class MongoDBClient:
             "_id": upload_id,
             "upload_id": upload_id,
             "status": "uploaded",
+            "is_deleted": False,
+            "deleted_at": None,
+            "deleted_by": None,
+            "delete_mode": None,
             "document_type": "bill_upload",
             "created_at": now,
+            "upload_date": now,
             "updated_at": now,
             "source_pdf": source_name,
             "original_filename": original_filename,
             "file_size_bytes": int(file_size_bytes or 0),
+            "employee_id": str(employee_id),
             # Keep both fields for backward compatibility with existing consumers.
             "hospital_name_metadata": hospital_name,
             "hospital_name": hospital_name,
             "schema_version": 2,
         }
+        if invoice_date:
+            doc["invoice_date"] = invoice_date
         if ingestion_request_id:
             doc["ingestion_request_id"] = ingestion_request_id
 
@@ -194,13 +204,19 @@ class MongoDBClient:
             logger.error(f"Bill validation failed before completion update: {error_msg}")
 
         data = self._validate_and_transform(bill_data)
-        now = datetime.now().isoformat()
+        existing_doc = self.collection.find_one(
+            {"_id": upload_id},
+            {"processing_started_at": 1, "created_at": 1},
+        ) or {}
+        now_dt = datetime.now()
+        now = now_dt.isoformat()
 
         update = {
             "$set": {
                 "updated_at": now,
                 "status": "completed",
                 "processing_completed_at": now,
+                "completed_at": now,
                 "page_count": data.get("page_count"),
                 "extraction_date": data.get("extraction_date"),
                 "header": data.get("header", {}) or {},
@@ -216,6 +232,31 @@ class MongoDBClient:
                 "hospital_name": data.get("hospital_name"),
             }
         }
+
+        started_at = existing_doc.get("processing_started_at") or existing_doc.get("created_at")
+        if started_at:
+            started_dt = None
+            try:
+                started_str = str(started_at).replace("Z", "+00:00")
+                started_dt = datetime.fromisoformat(started_str)
+            except Exception:
+                started_dt = None
+            if started_dt is not None:
+                if started_dt.tzinfo is not None:
+                    now_ref = datetime.now(started_dt.tzinfo)
+                else:
+                    now_ref = now_dt
+                duration_seconds = max(0.0, (now_ref - started_dt).total_seconds())
+                update["$set"]["processing_time_seconds"] = round(duration_seconds, 3)
+
+        # Promote extracted header billing date to top-level invoice_date for dashboard use.
+        # Keep any existing/manual value when extraction does not yield a date.
+        extracted_invoice_date = (
+            data.get("invoice_date")
+            or (data.get("header", {}) or {}).get("billing_date")
+        )
+        if extracted_invoice_date:
+            update["$set"]["invoice_date"] = str(extracted_invoice_date).strip()
 
         # Preserve ingestion-level metadata if extraction layer provides updates.
         source_pdf = data.get("source_pdf")
@@ -370,15 +411,67 @@ class MongoDBClient:
         format_version: str = "v1",
     ) -> bool:
         """Persist verification output for frontend dashboard consumption."""
-        now = datetime.now().isoformat()
+        now_dt = datetime.now()
+        now = now_dt.isoformat()
+        existing_doc = self.collection.find_one(
+            {"_id": upload_id},
+            {"processing_started_at": 1, "created_at": 1, "upload_date": 1},
+        ) or {}
+
+        processing_time_seconds = None
+        started_at = (
+            existing_doc.get("processing_started_at")
+            or existing_doc.get("created_at")
+            or existing_doc.get("upload_date")
+        )
+        if started_at:
+            started_dt = None
+            try:
+                started_str = str(started_at).replace("Z", "+00:00")
+                started_dt = datetime.fromisoformat(started_str)
+            except Exception:
+                started_dt = None
+            if started_dt is not None:
+                if started_dt.tzinfo is not None:
+                    now_ref = datetime.now(started_dt.tzinfo)
+                else:
+                    now_ref = now_dt
+                processing_time_seconds = round(max(0.0, (now_ref - started_dt).total_seconds()), 3)
+
+        set_data: Dict[str, Any] = {
+            "verification_status": "completed",
+            "verification_result": verification_result or {},
+            "verification_result_text": str(verification_result_text or ""),
+            "verification_format_version": str(format_version or "v1"),
+            "verification_updated_at": now,
+            "verification_completed_at": now,
+            "updated_at": now,
+            # Keep dashboard processing lifecycle aligned with true end-to-end completion.
+            "processing_completed_at": now,
+            "completed_at": now,
+        }
+        if processing_time_seconds is not None:
+            set_data["processing_time_seconds"] = processing_time_seconds
+
         result = self.collection.update_one(
             {"_id": upload_id},
+            {"$set": set_data},
+            upsert=False,
+        )
+        return result.modified_count == 1
+
+    def mark_verification_processing(self, upload_id: str) -> bool:
+        """Atomically mark verification as processing when not already completed/processing."""
+        now = datetime.now().isoformat()
+        result = self.collection.update_one(
+            {
+                "_id": upload_id,
+                "verification_status": {"$nin": ["processing", "completed"]},
+            },
             {
                 "$set": {
-                    "verification_status": "completed",
-                    "verification_result": verification_result or {},
-                    "verification_result_text": str(verification_result_text or ""),
-                    "verification_format_version": str(format_version or "v1"),
+                    "verification_status": "processing",
+                    "verification_started_at": now,
                     "verification_updated_at": now,
                     "updated_at": now,
                 }
@@ -387,12 +480,29 @@ class MongoDBClient:
         )
         return result.modified_count == 1
 
-    def soft_delete_upload(self, upload_id: str) -> Dict[str, Any]:
+    def mark_verification_failed(self, upload_id: str, error_message: str) -> bool:
+        """Persist verification failure to prevent indefinite dashboard polling."""
+        now = datetime.now().isoformat()
+        result = self.collection.update_one(
+            {"_id": upload_id},
+            {
+                "$set": {
+                    "verification_status": "failed",
+                    "verification_error": str(error_message or "Verification failed"),
+                    "verification_updated_at": now,
+                    "updated_at": now,
+                }
+            },
+            upsert=False,
+        )
+        return result.modified_count == 1
+
+    def soft_delete_upload(self, upload_id: str, deleted_by: Optional[str] = None) -> Dict[str, Any]:
         """Soft-delete all records linked to an upload_id.
 
         Behavior:
         - Idempotent: repeated calls succeed.
-        - Marks linked records with deleted_at + status=deleted.
+        - Marks linked records with is_deleted=true + deleted_at + status=deleted.
         - Attempts transactional execution when supported.
         """
         now = datetime.now().isoformat()
@@ -406,32 +516,58 @@ class MongoDBClient:
         active_filter: Dict[str, Any] = {
             "$and": [
                 linked_filter,
+                {"is_deleted": {"$ne": True}},
                 {"deleted_at": {"$exists": False}},
             ]
         }
 
         update_doc = {
             "$set": {
+                "is_deleted": True,
                 "deleted_at": now,
+                "deleted_by": deleted_by,
+                "delete_mode": "temporary",
                 "updated_at": now,
-                "status": "deleted",
             }
         }
 
         def _run(session=None) -> Dict[str, Any]:
             matched_total = self.collection.count_documents(linked_filter, session=session)
             modified = self.collection.update_many(active_filter, update_doc, session=session)
+            deleted_doc = self.collection.find_one(
+                {
+                    "$and": [
+                        linked_filter,
+                        {
+                            "$or": [
+                                {"is_deleted": True},
+                                {"deleted_at": {"$exists": True}},
+                            ]
+                        },
+                    ]
+                },
+                {"deleted_at": 1},
+                session=session,
+            )
             already_deleted = self.collection.count_documents(
                 {
                     "$and": [
                         linked_filter,
-                        {"deleted_at": {"$exists": True}},
+                        {
+                            "$or": [
+                                {"is_deleted": True},
+                                {"deleted_at": {"$exists": True}},
+                            ]
+                        },
                     ]
                 },
                 session=session,
             )
             return {
                 "upload_id": upload_id,
+                "deleted_at": (
+                    now if int(modified.modified_count) > 0 else deleted_doc.get("deleted_at") if deleted_doc else None
+                ),
                 "matched_total": int(matched_total),
                 "modified_count": int(modified.modified_count),
                 "already_deleted_count": int(already_deleted),
@@ -444,6 +580,77 @@ class MongoDBClient:
         except Exception as tx_err:
             logger.warning(f"Transaction not available for soft_delete_upload({upload_id}): {tx_err}")
             return _run(session=None)
+
+    def restore_upload(self, upload_id: str) -> Dict[str, Any]:
+        """Restore a soft-deleted upload."""
+        now = datetime.now().isoformat()
+        linked_filter: Dict[str, Any] = {
+            "$or": [
+                {"_id": upload_id},
+                {"upload_id": upload_id},
+                {"parent_upload_id": upload_id},
+            ]
+        }
+        deleted_filter: Dict[str, Any] = {
+            "$and": [
+                linked_filter,
+                {
+                    "$or": [
+                        {"is_deleted": True},
+                        {"deleted_at": {"$exists": True}},
+                    ]
+                },
+            ]
+        }
+
+        result = self.collection.update_many(
+            deleted_filter,
+            {
+                "$set": {
+                    "is_deleted": False,
+                    "deleted_at": None,
+                    "deleted_by": None,
+                    "delete_mode": None,
+                    "updated_at": now,
+                }
+            },
+        )
+        matched_total = self.collection.count_documents(linked_filter)
+        return {
+            "upload_id": upload_id,
+            "matched_total": int(matched_total),
+            "modified_count": int(result.modified_count),
+        }
+
+    def hard_delete_upload(self, upload_id: str) -> Dict[str, Any]:
+        """Permanently delete records linked to an upload_id."""
+        linked_filter: Dict[str, Any] = {
+            "$or": [
+                {"_id": upload_id},
+                {"upload_id": upload_id},
+                {"parent_upload_id": upload_id},
+            ]
+        }
+        deleted_filter: Dict[str, Any] = {
+            "$and": [
+                linked_filter,
+                {
+                    "$or": [
+                        {"is_deleted": True},
+                        {"deleted_at": {"$exists": True}},
+                    ]
+                },
+            ]
+        }
+        matched_total = self.collection.count_documents(linked_filter)
+        deleted_matches = self.collection.count_documents(deleted_filter)
+        delete_result = self.collection.delete_many(deleted_filter)
+        return {
+            "upload_id": upload_id,
+            "matched_total": int(matched_total),
+            "deleted_matches": int(deleted_matches),
+            "deleted_count": int(delete_result.deleted_count),
+        }
 
     def get_bills_by_patient_mrn(self, mrn: str) -> List[Dict[str, Any]]:
         return list(self.collection.find({"patient.mrn": mrn}))

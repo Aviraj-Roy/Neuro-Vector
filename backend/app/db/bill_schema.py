@@ -157,6 +157,7 @@ class BillDocument(BaseModel):
     """One uploaded PDF = one MongoDB BillDocument."""
     # Stable identity
     upload_id: Optional[str] = None
+    employee_id: Optional[str] = None
     source_pdf: Optional[str] = None
     page_count: int = 1
     # Extraction metadata
@@ -175,6 +176,18 @@ class BillDocument(BaseModel):
     grand_total: float = 0.0
     # Store raw OCR excerpt for debugging
     raw_ocr_text: Optional[str] = None
+
+    @field_validator("employee_id")
+    @classmethod
+    def validate_employee_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        clean_value = str(value).strip()
+        if not clean_value:
+            return None
+        if not re.fullmatch(r"\d{8}", clean_value):
+            raise ValueError("employee_id must contain exactly 8 digits")
+        return clean_value
 
     def calculate_subtotals(self) -> Dict[str, float]:
         subtotals: Dict[str, float] = {}

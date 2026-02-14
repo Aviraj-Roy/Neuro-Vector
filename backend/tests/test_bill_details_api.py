@@ -18,6 +18,7 @@ from app.api.routes import router
 class FakeMongoDBClient:
     shared_doc: Optional[Dict[str, Any]] = None
     saved_payload: Optional[Dict[str, Any]] = None
+    verification_marked = False
 
     def __init__(self, validate_schema: bool = False):
         self.validate_schema = validate_schema
@@ -43,12 +44,27 @@ class FakeMongoDBClient:
         }
         return True
 
+    def mark_verification_processing(self, upload_id: str) -> bool:
+        if not FakeMongoDBClient.shared_doc:
+            return False
+        FakeMongoDBClient.shared_doc["verification_status"] = "processing"
+        FakeMongoDBClient.verification_marked = True
+        return True
+
+    def mark_verification_failed(self, upload_id: str, error_message: str) -> bool:
+        if not FakeMongoDBClient.shared_doc:
+            return False
+        FakeMongoDBClient.shared_doc["verification_status"] = "failed"
+        FakeMongoDBClient.shared_doc["verification_error"] = error_message
+        return True
+
 
 def _build_client(monkeypatch, doc: Optional[Dict[str, Any]] = None) -> TestClient:
     import app.db.mongo_client as mongo_client_module
 
     FakeMongoDBClient.shared_doc = doc
     FakeMongoDBClient.saved_payload = None
+    FakeMongoDBClient.verification_marked = False
     monkeypatch.setattr(mongo_client_module, "MongoDBClient", FakeMongoDBClient)
     app = FastAPI()
     app.include_router(router)
@@ -212,3 +228,40 @@ def test_verify_persists_formatted_verification_text(monkeypatch):
     assert FakeMongoDBClient.saved_payload["upload_id"] == bill_id
     assert FakeMongoDBClient.saved_payload["format_version"] == "v1"
     assert "Overall Summary" in FakeMongoDBClient.saved_payload["verification_result_text"]
+
+
+def test_get_bill_returns_processing_while_on_demand_verification_runs(monkeypatch):
+    bill_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    doc = {
+        "_id": bill_id,
+        "upload_id": bill_id,
+        "status": "completed",
+        "hospital_name_metadata": "Apollo Hospital",
+        "verification_result_text": "",
+    }
+    client = _build_client(monkeypatch, doc)
+
+    resp = client.get(f"/bill/{bill_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "processing"
+    assert "Verification is processing" in body["verificationResult"]
+    assert FakeMongoDBClient.verification_marked is False
+
+
+def test_get_bill_returns_failed_when_verification_failed(monkeypatch):
+    bill_id = "ffffffffffffffffffffffffffffffff"
+    doc = {
+        "_id": bill_id,
+        "upload_id": bill_id,
+        "status": "completed",
+        "verification_status": "failed",
+        "verification_result_text": "",
+    }
+    client = _build_client(monkeypatch, doc)
+
+    resp = client.get(f"/bill/{bill_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "failed"
+    assert "Verification failed" in body["verificationResult"]
