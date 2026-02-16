@@ -59,6 +59,17 @@ load_dotenv(dotenv_path=env_path if env_path.exists() else None)
 # MongoDB configuration
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "medical_bills")
+MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "bills")
+
+# Soft-delete retention configuration
+BILL_RETENTION_DAYS = int(os.getenv("BILL_RETENTION_DAYS", "30"))
+BILL_RETENTION_CLEANUP_INTERVAL_SECONDS = int(
+    os.getenv("BILL_RETENTION_CLEANUP_INTERVAL_SECONDS", "3600")
+)
+
+# Queue processing configuration
+QUEUE_STALE_PROCESSING_SECONDS = int(os.getenv("QUEUE_STALE_PROCESSING_SECONDS", "1800"))
+QUEUE_RECONCILE_INTERVAL_SECONDS = int(os.getenv("QUEUE_RECONCILE_INTERVAL_SECONDS", "60"))
 
 # OCR configuration
 OCR_CONFIDENCE_THRESHOLD = float(

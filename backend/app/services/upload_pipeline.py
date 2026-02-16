@@ -3,17 +3,32 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import HTTPException, UploadFile
 
-from app.config import UPLOADS_DIR
+from app.config import (
+    QUEUE_RECONCILE_INTERVAL_SECONDS,
+    QUEUE_STALE_PROCESSING_SECONDS,
+    UPLOADS_DIR,
+)
 from app.db.mongo_client import MongoDBClient
 from app.main import process_bill
 
 logger = logging.getLogger(__name__)
+_QUEUE_LOCK = threading.Lock()
+_QUEUE_WAKE_EVENT = threading.Event()
+_WORKER_THREAD: Optional[threading.Thread] = None
+_STALE_PROCESSING_SECONDS = QUEUE_STALE_PROCESSING_SECONDS
+_QUEUE_RECONCILE_INTERVAL_SECONDS = QUEUE_RECONCILE_INTERVAL_SECONDS
+_STATUS_PENDING = "PENDING"
+_STATUS_PROCESSING = "PROCESSING"
+_STATUS_COMPLETED = "COMPLETED"
+_STATUS_UPLOADED = "UPLOADED"
+_STATUS_FAILED = "FAILED"
 
 
 def _process_bill_async(
@@ -31,6 +46,7 @@ def _process_bill_async(
             upload_id=upload_id,
             original_filename=original_filename,
             auto_cleanup=True,
+            assume_processing_claimed=True,
         )
 
         # Run verification automatically as part of upload processing lifecycle,
@@ -73,6 +89,88 @@ def _process_bill_async(
                 pdf_path.unlink()
         except Exception as cleanup_err:
             logger.warning("Failed to clean up uploaded PDF %s: %s", pdf_path, cleanup_err)
+
+
+def _queue_worker_loop() -> None:
+    """Strict single-worker FIFO queue processor."""
+    db = MongoDBClient(validate_schema=False)
+    last_reconcile_ts = 0.0
+    try:
+        stats = db.reconcile_queue_state(stale_after_seconds=_STALE_PROCESSING_SECONDS)
+        if stats.get("stale_recovered", 0) > 0 or stats.get("extra_processing_demoted", 0) > 0:
+            logger.warning("Queue reconciliation on startup: %s", stats)
+    except Exception as e:
+        logger.warning("Queue recovery failed: %s", e)
+
+    while True:
+        try:
+            now_ts = time.time()
+            if now_ts - last_reconcile_ts >= max(10, _QUEUE_RECONCILE_INTERVAL_SECONDS):
+                last_reconcile_ts = now_ts
+                try:
+                    db.reconcile_queue_state(stale_after_seconds=_STALE_PROCESSING_SECONDS)
+                except Exception as reconcile_err:
+                    logger.warning("Queue reconciliation iteration failed: %s", reconcile_err)
+
+            claimed = db.claim_next_pending_job()
+            if not claimed:
+                _QUEUE_WAKE_EVENT.wait(timeout=5.0)
+                _QUEUE_WAKE_EVENT.clear()
+                continue
+
+            upload_id = str(claimed.get("upload_id") or claimed.get("_id") or "")
+            temp_pdf_path = Path(str(claimed.get("temp_pdf_path") or "").strip())
+            hospital_name = str(
+                claimed.get("queue_hospital_name")
+                or claimed.get("hospital_name_metadata")
+                or claimed.get("hospital_name")
+                or ""
+            ).strip()
+            original_filename = str(
+                claimed.get("queue_original_filename")
+                or claimed.get("original_filename")
+                or temp_pdf_path.name
+                or "uploaded_bill.pdf"
+            ).strip()
+
+            if not upload_id or not temp_pdf_path or not temp_pdf_path.exists():
+                db.mark_failed(
+                    upload_id,
+                    f"Queued PDF not found for processing: {temp_pdf_path}",
+                )
+                continue
+
+            _process_bill_async(
+                pdf_path=temp_pdf_path,
+                upload_id=upload_id,
+                hospital_name=hospital_name,
+                original_filename=original_filename,
+            )
+            # Loop naturally claims next pending bill immediately (FIFO).
+            _QUEUE_WAKE_EVENT.set()
+
+        except Exception as e:
+            logger.error("Queue worker iteration failed: %s", e, exc_info=True)
+            time.sleep(1.0)
+
+
+def _ensure_queue_worker_started() -> None:
+    global _WORKER_THREAD
+    with _QUEUE_LOCK:
+        if _WORKER_THREAD and _WORKER_THREAD.is_alive():
+            return
+        _WORKER_THREAD = threading.Thread(
+            target=_queue_worker_loop,
+            daemon=True,
+            name="bill-queue-worker",
+        )
+        _WORKER_THREAD.start()
+
+
+def start_queue_worker() -> None:
+    """Public bootstrap for API server startup."""
+    _ensure_queue_worker_started()
+    _QUEUE_WAKE_EVENT.set()
 
 
 def _build_ingestion_request_id(
@@ -138,13 +236,13 @@ async def handle_pdf_upload(
     db = MongoDBClient(validate_schema=False)
     existing = db.get_bill_by_request_id(ingestion_request_id)
     existing_upload_id = str(existing.get("upload_id") or existing.get("_id")) if existing else None
-    existing_status = str(existing.get("status") or "").lower() if existing else ""
-    if existing and existing_status in {"processing", "completed"}:
+    existing_status = str(existing.get("status") or "").strip().upper() if existing else ""
+    if existing and existing_status in {_STATUS_PROCESSING, _STATUS_COMPLETED}:
         return {
             "upload_id": existing_upload_id,
             "employee_id": str(existing.get("employee_id") or clean_employee_id),
             "hospital_name": clean_hospital,
-            "status": existing_status or "uploaded",
+            "status": existing_status or _STATUS_PENDING,
             "page_count": existing.get("page_count"),
             "file_size_bytes": int(existing.get("file_size_bytes") or file_size_bytes),
             "original_filename": existing.get("original_filename") or original_filename,
@@ -159,7 +257,7 @@ async def handle_pdf_upload(
     with open(temp_pdf_path, "wb") as f:
         f.write(contents)
 
-    if existing and existing_status in {"uploaded", "failed"}:
+    if existing and existing_status in {_STATUS_PENDING, _STATUS_UPLOADED, _STATUS_FAILED}:
         create_result = {"upload_id": upload_id, "created": False, "status": existing_status}
     else:
         create_result = db.create_upload_record(
@@ -173,33 +271,28 @@ async def handle_pdf_upload(
             ingestion_request_id=ingestion_request_id,
         )
     effective_upload_id = create_result["upload_id"]
-    current_status = str(create_result.get("status") or "uploaded")
-
-    if create_result.get("created", False) or current_status in {"uploaded", "failed"}:
-        worker = threading.Thread(
-            target=_process_bill_async,
-            kwargs={
-                "pdf_path": temp_pdf_path,
-                "upload_id": effective_upload_id,
-                "hospital_name": clean_hospital,
-                "original_filename": original_filename,
-            },
-            daemon=True,
-            name=f"bill-process-{effective_upload_id[:8]}",
-        )
-        worker.start()
+    current_status = str(create_result.get("status") or _STATUS_PENDING).strip().upper()
+    db.enqueue_upload_job(
+        upload_id=effective_upload_id,
+        temp_pdf_path=str(temp_pdf_path),
+        hospital_name=clean_hospital,
+        original_filename=original_filename,
+    )
+    _ensure_queue_worker_started()
+    _QUEUE_WAKE_EVENT.set()
 
     doc = db.get_bill(effective_upload_id) or {}
     return {
         "upload_id": effective_upload_id,
         "employee_id": str(doc.get("employee_id") or clean_employee_id),
         "hospital_name": clean_hospital,
-        "status": str(doc.get("status") or current_status),
+        "status": str(doc.get("status") or current_status or _STATUS_PENDING).strip().upper(),
+        "queue_position": doc.get("queue_position"),
         "page_count": doc.get("page_count"),
         "file_size_bytes": int(doc.get("file_size_bytes") or file_size_bytes),
         "original_filename": doc.get("original_filename") or original_filename,
         "upload_date": doc.get("upload_date") or doc.get("created_at"),
         "invoice_date": doc.get("invoice_date") or clean_invoice_date,
-        "message": "Bill uploaded successfully and processing started",
+        "message": "Bill uploaded successfully and queued for processing",
         "existing": not create_result.get("created", False),
     }

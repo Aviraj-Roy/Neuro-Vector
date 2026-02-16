@@ -59,6 +59,7 @@ def _matches(doc: Dict[str, Any], query: Dict[str, Any]) -> bool:
 
 class FakeMongoDBClient:
     shared_docs: List[Dict[str, Any]] = []
+    permanent_delete_calls: List[str] = []
 
     def __init__(self, validate_schema: bool = False):
         self.validate_schema = validate_schema
@@ -173,7 +174,7 @@ class FakeMongoDBClient:
             modified += 1
         return {"upload_id": upload_id, "matched_total": matched, "modified_count": modified}
 
-    def hard_delete_upload(self, upload_id: str):
+    def hard_delete_upload(self, upload_id: str, include_active: bool = False):
         matched_total = 0
         deleted_matches = 0
         keep: List[Dict[str, Any]] = []
@@ -186,7 +187,7 @@ class FakeMongoDBClient:
             is_deleted = bool(d.get("is_deleted") is True or d.get("deleted_at"))
             if is_deleted:
                 deleted_matches += 1
-            else:
+            if not include_active and not is_deleted:
                 keep.append(d)
         deleted_count = len(FakeMongoDBClient.shared_docs) - len(keep)
         FakeMongoDBClient.shared_docs = keep
@@ -197,11 +198,25 @@ class FakeMongoDBClient:
             "deleted_count": deleted_count,
         }
 
+    def permanent_delete_upload(self, upload_id: str, include_active: bool = False):
+        FakeMongoDBClient.permanent_delete_calls.append(upload_id)
+        result = self.hard_delete_upload(upload_id, include_active=include_active)
+        result.update(
+            {
+                "deleted_file_count": 0,
+                "deleted_files": [],
+                "failed_file_count": 0,
+                "failed_files": [],
+            }
+        )
+        return result
+
 
 def _build_client(monkeypatch, docs: List[Dict[str, Any]]) -> TestClient:
     import app.db.mongo_client as mongo_client_module
 
     FakeMongoDBClient.shared_docs = docs
+    FakeMongoDBClient.permanent_delete_calls = []
     monkeypatch.setattr(mongo_client_module, "MongoDBClient", FakeMongoDBClient)
     app = FastAPI()
     app.include_router(router)
@@ -210,7 +225,15 @@ def _build_client(monkeypatch, docs: List[Dict[str, Any]]) -> TestClient:
 
 def test_get_bills_scope_active_excludes_deleted(monkeypatch):
     docs = [
-        {"_id": "a" * 32, "upload_id": "a" * 32, "employee_id": "11111111", "status": "completed", "updated_at": "2026-02-14T10:00:00"},
+        {
+            "_id": "a" * 32,
+            "upload_id": "a" * 32,
+            "employee_id": "11111111",
+            "status": "completed",
+            "processing_started_at": "2026-02-14T09:55:00",
+            "completed_at": "2026-02-14T10:00:00",
+            "updated_at": "2026-02-14T10:00:00",
+        },
         {"_id": "b" * 32, "upload_id": "b" * 32, "employee_id": "22222222", "status": "completed", "is_deleted": True, "deleted_at": "2026-02-14T11:00:00", "updated_at": "2026-02-14T11:00:00"},
     ]
     client = _build_client(monkeypatch, docs)
@@ -221,6 +244,35 @@ def test_get_bills_scope_active_excludes_deleted(monkeypatch):
     assert len(rows) == 1
     assert rows[0]["employee_id"] == "11111111"
     assert rows[0]["is_deleted"] is False
+    assert rows[0]["status"] == "COMPLETED"
+    assert rows[0]["processing_started_at"] == "2026-02-14T09:55:00"
+    assert rows[0]["completed_at"] == "2026-02-14T10:00:00"
+
+
+def test_get_bills_includes_queue_fields_for_pending(monkeypatch):
+    pending_id = "9" * 32
+    docs = [
+        {
+            "_id": pending_id,
+            "upload_id": pending_id,
+            "employee_id": "10101010",
+            "status": "PENDING",
+            "queue_position": 3,
+            "processing_started_at": None,
+            "completed_at": None,
+            "updated_at": "2026-02-16T10:00:00",
+        }
+    ]
+    client = _build_client(monkeypatch, docs)
+
+    resp = client.get("/bills?scope=active")
+    assert resp.status_code == 200
+    rows = resp.json()
+    assert len(rows) == 1
+    assert rows[0]["status"] == "PENDING"
+    assert rows[0]["queue_position"] == 3
+    assert rows[0]["processing_started_at"] is None
+    assert rows[0]["completed_at"] is None
 
 
 def test_get_bills_scope_deleted_returns_only_deleted(monkeypatch):
@@ -236,6 +288,19 @@ def test_get_bills_scope_deleted_returns_only_deleted(monkeypatch):
     assert len(rows) == 1
     assert rows[0]["employee_id"] == "44444444"
     assert rows[0]["is_deleted"] is True
+
+
+def test_get_bills_include_deleted_returns_active_and_deleted(monkeypatch):
+    docs = [
+        {"_id": "aa" * 16, "upload_id": "aa" * 16, "employee_id": "12341234", "status": "PROCESSING", "updated_at": "2026-02-14T10:00:00"},
+        {"_id": "bb" * 16, "upload_id": "bb" * 16, "employee_id": "56785678", "status": "COMPLETED", "is_deleted": True, "deleted_at": "2026-02-14T11:00:00", "updated_at": "2026-02-14T11:00:00"},
+    ]
+    client = _build_client(monkeypatch, docs)
+
+    resp = client.get("/bills?include_deleted=true")
+    assert resp.status_code == 200
+    rows = resp.json()
+    assert len(rows) == 2
 
 
 def test_soft_delete_flow(monkeypatch):
@@ -291,6 +356,7 @@ def test_permanent_delete_flow(monkeypatch):
     resp = client.delete(f"/bills/{bill_id}?permanent=true")
     assert resp.status_code == 200
     assert resp.json()["message"] == "Bill permanently deleted"
+    assert bill_id in FakeMongoDBClient.permanent_delete_calls
 
     check = client.get("/bills?scope=deleted")
     assert check.status_code == 200
@@ -341,9 +407,69 @@ def test_invalid_transitions(monkeypatch):
 
     # restore active bill
     assert client.post(f"/bills/{active_id}/restore").status_code == 409
-    # soft-delete already deleted
-    assert client.delete(f"/bills/{deleted_id}").status_code == 409
-    # permanent delete active
-    assert client.delete(f"/bills/{active_id}?permanent=true").status_code == 409
+    # soft-delete already deleted should be idempotent
+    already_deleted = client.delete(f"/bills/{deleted_id}")
+    assert already_deleted.status_code == 200
+    assert already_deleted.json()["message"] == "Bill already soft-deleted"
+    # permanent delete active completed bill should auto-soft+hard delete
+    active_perm = client.delete(f"/bills/{active_id}?permanent=true")
+    assert active_perm.status_code == 200
+    assert active_perm.json()["message"] == "Bill permanently deleted"
+    # permanent delete deleted bill should succeed
+    assert client.delete(f"/bills/{deleted_id}?permanent=true").status_code == 200
     # permanent delete non-existent
-    assert client.delete(f"/bills/{'6'*32}?permanent=true").status_code == 404
+    missing = client.delete(f"/bills/{'6'*32}?permanent=true")
+    assert missing.status_code == 404
+    detail = missing.json().get("detail") or {}
+    assert detail.get("code") == "BILL_NOT_FOUND"
+    assert detail.get("message") == "Bill not found"
+
+
+def test_permanent_delete_allowed_for_pending_or_processing(monkeypatch):
+    pending_id = "7" * 32
+    processing_id = "8" * 32
+    docs = [
+        {"_id": pending_id, "upload_id": pending_id, "employee_id": "56565656", "status": "pending", "updated_at": "2026-02-14T10:00:00"},
+        {"_id": processing_id, "upload_id": processing_id, "employee_id": "78787878", "status": "processing", "updated_at": "2026-02-14T10:05:00"},
+    ]
+    client = _build_client(monkeypatch, docs)
+
+    # permanent delete auto-soft+hard deletes active records
+    pending_active_perm = client.delete(f"/bills/{pending_id}?permanent=true")
+    assert pending_active_perm.status_code == 200
+    assert pending_active_perm.json()["message"] == "Bill permanently deleted"
+
+    processing_active_perm = client.delete(f"/bills/{processing_id}?permanent=true")
+    assert processing_active_perm.status_code == 200
+    assert processing_active_perm.json()["message"] == "Bill permanently deleted"
+
+
+def test_repeated_delete_calls_are_safe(monkeypatch):
+    bill_id = "c" * 32
+    docs = [{"_id": bill_id, "upload_id": bill_id, "employee_id": "90909090", "status": "completed", "updated_at": "2026-02-14T12:00:00"}]
+    client = _build_client(monkeypatch, docs)
+
+    first_soft = client.delete(f"/bills/{bill_id}")
+    assert first_soft.status_code == 200
+    second_soft = client.delete(f"/bills/{bill_id}")
+    assert second_soft.status_code == 200
+    assert second_soft.json()["message"] == "Bill already soft-deleted"
+
+    first_perm = client.delete(f"/bills/{bill_id}?permanent=true")
+    assert first_perm.status_code == 200
+    second_perm = client.delete(f"/bills/{bill_id}?permanent=true")
+    assert second_perm.status_code == 404
+
+
+def test_legacy_bill_delete_route_matches_behavior(monkeypatch):
+    bill_id = "d" * 32
+    docs = [{"_id": bill_id, "upload_id": bill_id, "employee_id": "30303030", "status": "completed", "updated_at": "2026-02-14T12:00:00"}]
+    client = _build_client(monkeypatch, docs)
+
+    soft = client.delete(f"/bill/{bill_id}")
+    assert soft.status_code == 200
+    assert soft.json()["message"] in {"Bill soft-deleted successfully", "Bill already soft-deleted"}
+
+    hard = client.delete(f"/bill/{bill_id}?permanent=true")
+    assert hard.status_code == 200
+    assert hard.json()["message"] == "Bill permanently deleted"

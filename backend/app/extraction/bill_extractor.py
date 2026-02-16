@@ -931,7 +931,9 @@ class ItemParser:
                 "item_id": item_id,
                 "description": parsed.description,
                 "qty": parsed.qty,
+                "quantity": parsed.qty,  # alias for downstream consumers
                 "unit_rate": parsed.unit_rate,
+                "rate": parsed.unit_rate,  # alias for downstream consumers
                 "pdf_amount": parsed.pdf_amount,
                 "computed_amount": parsed.computed_amount,
                 "final_amount": parsed.final_amount,
@@ -1015,7 +1017,9 @@ class ItemParser:
                 "item_id": item_id,
                 "description": text,
                 "qty": 1.0,  # Default qty for line-based parsing
+                "quantity": 1.0,  # alias for downstream consumers
                 "unit_rate": None,
+                "rate": None,  # alias for downstream consumers
                 "pdf_amount": amount,
                 "computed_amount": None,
                 "final_amount": amount,

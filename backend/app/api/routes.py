@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,7 @@ class UploadResponse(BaseModel):
     hospital_name: str = Field(..., description="Hospital name provided in the request")
     message: str = Field(..., description="Success message")
     status: str = Field(..., description="Processing status")
+    queue_position: Optional[int] = Field(None, description="FIFO queue position while pending")
     page_count: Optional[int] = Field(None, description="Number of pages in the PDF")
     original_filename: Optional[str] = Field(None, description="Original uploaded filename")
     file_size_bytes: Optional[int] = Field(None, description="Original uploaded PDF size in bytes")
@@ -150,6 +151,10 @@ class StatusResponse(BaseModel):
     page_count: Optional[int] = Field(None, description="Number of pages in the uploaded PDF")
     original_filename: Optional[str] = Field(None, description="Original uploaded filename")
     file_size_bytes: Optional[int] = Field(None, description="Original uploaded PDF size in bytes")
+    queue_position: Optional[int] = Field(None, description="FIFO queue position for pending uploads")
+    processing_started_at: Optional[str] = Field(None, description="When processing actually started")
+    completed_at: Optional[str] = Field(None, description="Completion timestamp for terminal states")
+    processing_time_seconds: Optional[float] = Field(None, description="Derived processing duration in seconds")
 
     class Config:
         json_schema_extra = {
@@ -179,6 +184,8 @@ class BillListItem(BaseModel):
     employee_id: str
     invoice_date: Optional[str] = None
     upload_date: Optional[str] = None
+    queue_position: Optional[int] = None
+    processing_started_at: Optional[str] = None
     processing_time_seconds: Optional[float] = None
     completed_at: Optional[str] = None
     hospital_name: Optional[str] = None
@@ -201,9 +208,75 @@ class DeleteBillResponse(BaseModel):
     deleted_at: Optional[str] = None
 
 
+def _http_error(status_code: int, code: str, message: str) -> None:
+    raise HTTPException(status_code=status_code, detail={"code": code, "message": message})
+
+
 class RestoreBillResponse(BaseModel):
     success: bool
     bill: BillListItem
+
+
+class LineItemEditInput(BaseModel):
+    category_name: str
+    item_index: int = Field(..., ge=0)
+    qty: Optional[float] = Field(None, ge=0)
+    rate: Optional[float] = Field(None, ge=0)
+
+    @field_validator("category_name")
+    @classmethod
+    def validate_category_name(cls, value: str) -> str:
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            raise ValueError("category_name is required")
+        return cleaned
+
+    @model_validator(mode="after")
+    def validate_has_any_edit(self):
+        if self.qty is None and self.rate is None:
+            raise ValueError("At least one of qty or rate must be provided")
+        return self
+
+
+class LineItemsPatchRequest(BaseModel):
+    line_items: list[LineItemEditInput] = Field(default_factory=list)
+    edited_by: Optional[str] = None
+
+    @field_validator("line_items")
+    @classmethod
+    def validate_line_items(cls, value: list[LineItemEditInput]) -> list[LineItemEditInput]:
+        if not value:
+            raise ValueError("line_items must contain at least one edit")
+        return value
+
+    @field_validator("edited_by")
+    @classmethod
+    def validate_edited_by(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
+
+
+class BillLineItem(BaseModel):
+    category_name: Optional[str] = Field(None, description="Original category name")
+    item_index: Optional[int] = Field(None, description="Index within category")
+    item_name: str = Field(..., description="Bill item name")
+    bill_item: Optional[str] = Field(
+        None,
+        description="Backward-compatible alias of item_name for legacy consumers",
+    )
+    best_match: Optional[str] = Field(None, description="Matched tie-up item name")
+    tieup_rate: Optional[float] = Field(None, description="Tie-up per-unit/fixed rate")
+    qty: Optional[float] = Field(None, description="Extracted quantity")
+    rate: Optional[float] = Field(None, description="Extracted billed unit rate")
+    billed_amount: Optional[float] = Field(None, description="Billed line amount")
+    amount_to_be_paid: Optional[float] = Field(
+        None,
+        description="Payable amount after policy/tie-up rule",
+    )
+    extra_amount: Optional[float] = Field(None, description="Non-payable extra amount")
+    decision: str = Field(..., description="Verification decision/status")
 
 
 class BillDetailResponse(BaseModel):
@@ -233,6 +306,17 @@ class BillDetailResponse(BaseModel):
     updated_at: Optional[str] = None
     is_deleted: bool = False
     deleted_at: Optional[str] = None
+    line_items: list[BillLineItem] = Field(
+        default_factory=list,
+        description="Structured bill line items for frontend table rendering",
+    )
+
+
+class LineItemsPatchResponse(BaseModel):
+    upload_id: str
+    edited_at: str
+    edited_by: Optional[str] = None
+    line_items: list[BillLineItem] = Field(default_factory=list)
 
 
 def _is_valid_upload_id(upload_id: str) -> bool:
@@ -270,6 +354,232 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _to_number_or_none(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    cleaned = re.sub(r"(?i)(rs\.?|inr|\u20b9)", "", text).replace(",", "")
+    match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_text_or_none(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _extract_bill_source_items(bill_doc: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    source_items: dict[str, list[dict[str, Any]]] = {}
+    for _, category_items in (bill_doc.get("items") or {}).items():
+        if not isinstance(category_items, list):
+            continue
+        for raw_item in category_items:
+            if not isinstance(raw_item, dict):
+                continue
+            item_name = _to_text_or_none(
+                raw_item.get("item_name")
+                or raw_item.get("description")
+                or raw_item.get("bill_item")
+            )
+            if not item_name:
+                continue
+            key = item_name.casefold()
+            source_items.setdefault(key, []).append(raw_item)
+    return source_items
+
+
+def _pick_explicit_payable_amount(
+    verification_item: dict[str, Any], source_item: dict[str, Any]
+) -> Optional[float]:
+    candidate_keys = (
+        "amount_to_be_paid",
+        "amount_payable",
+        "payable_amount",
+        "approved_amount",
+        "settled_amount",
+    )
+    for payload in (verification_item, source_item):
+        for key in candidate_keys:
+            value = _to_number_or_none(payload.get(key))
+            if value is not None:
+                return round(value, 2)
+    return None
+
+
+def _category_item_counts(verification_result: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for category_result in verification_result.get("results") or []:
+        if not isinstance(category_result, dict):
+            continue
+        category_name = _to_text_or_none(category_result.get("category"))
+        if not category_name:
+            continue
+        items = category_result.get("items")
+        item_count = len(items) if isinstance(items, list) else 0
+        counts[category_name.casefold()] = item_count
+    return counts
+
+
+def _category_name_lookup(verification_result: dict[str, Any]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for category_result in verification_result.get("results") or []:
+        if not isinstance(category_result, dict):
+            continue
+        category_name = _to_text_or_none(category_result.get("category"))
+        if not category_name:
+            continue
+        lookup[category_name.casefold()] = category_name
+    return lookup
+
+
+def _line_item_edits_map(
+    line_item_edits: Any,
+) -> dict[tuple[str, int], dict[str, Any]]:
+    edits_map: dict[tuple[str, int], dict[str, Any]] = {}
+    if not isinstance(line_item_edits, list):
+        return edits_map
+    for edit in line_item_edits:
+        if not isinstance(edit, dict):
+            continue
+        category_name = _to_text_or_none(edit.get("category_name"))
+        item_index = edit.get("item_index")
+        if category_name is None or not isinstance(item_index, int) or item_index < 0:
+            continue
+        edits_map[(category_name.casefold(), item_index)] = edit
+    return edits_map
+
+
+def _normalize_line_item_entry(raw_item: dict[str, Any]) -> dict[str, Any]:
+    item_name = _to_text_or_none(raw_item.get("item_name") or raw_item.get("bill_item")) or "N/A"
+    decision = _to_text_or_none(raw_item.get("decision") or raw_item.get("status")) or "unknown"
+    return {
+        "category_name": _to_text_or_none(raw_item.get("category_name")),
+        "item_index": (
+            int(raw_item.get("item_index"))
+            if isinstance(raw_item.get("item_index"), int) and raw_item.get("item_index") >= 0
+            else None
+        ),
+        "item_name": item_name,
+        "bill_item": item_name,
+        "best_match": _to_text_or_none(raw_item.get("best_match") or raw_item.get("matched_item")),
+        "tieup_rate": _to_number_or_none(raw_item.get("tieup_rate")),
+        "qty": _to_number_or_none(raw_item.get("qty")),
+        "rate": _to_number_or_none(raw_item.get("rate")),
+        "billed_amount": _to_number_or_none(raw_item.get("billed_amount")),
+        "amount_to_be_paid": _to_number_or_none(raw_item.get("amount_to_be_paid")),
+        "extra_amount": _to_number_or_none(raw_item.get("extra_amount")),
+        "decision": decision,
+    }
+
+
+def _build_line_items_from_verification(
+    bill_doc: dict[str, Any], verification_result: dict[str, Any]
+) -> list[dict[str, Any]]:
+    if not isinstance(verification_result, dict):
+        return []
+    results = verification_result.get("results")
+    if not isinstance(results, list):
+        return []
+
+    source_items = _extract_bill_source_items(bill_doc)
+    edits_map = _line_item_edits_map(bill_doc.get("line_item_edits"))
+    line_items: list[dict[str, Any]] = []
+
+    for category_result in results:
+        if not isinstance(category_result, dict):
+            continue
+        category_name = _to_text_or_none(category_result.get("category")) or "unknown"
+        for item_index, item in enumerate(category_result.get("items") or []):
+            if not isinstance(item, dict):
+                continue
+
+            item_name = _to_text_or_none(item.get("item_name") or item.get("bill_item")) or "N/A"
+            source_queue = source_items.get(item_name.casefold()) or []
+            source_item = source_queue.pop(0) if source_queue else {}
+            diagnostics = item.get("diagnostics") if isinstance(item.get("diagnostics"), dict) else {}
+            edit_entry = edits_map.get((category_name.casefold(), item_index))
+            has_edit = isinstance(edit_entry, dict)
+
+            qty = (
+                _to_number_or_none(item.get("qty"))
+                if item.get("qty") is not None
+                else _to_number_or_none(item.get("quantity"))
+            )
+            if qty is None:
+                qty = _to_number_or_none(source_item.get("qty") or source_item.get("quantity"))
+            if has_edit and edit_entry.get("qty") is not None:
+                qty = _to_number_or_none(edit_entry.get("qty"))
+
+            rate = _to_number_or_none(item.get("rate") or item.get("unit_rate"))
+            if rate is None:
+                rate = _to_number_or_none(source_item.get("rate") or source_item.get("unit_rate"))
+            if has_edit and edit_entry.get("rate") is not None:
+                rate = _to_number_or_none(edit_entry.get("rate"))
+
+            billed_amount = _to_number_or_none(item.get("billed_amount") or item.get("bill_amount"))
+            if billed_amount is None:
+                billed_amount = _to_number_or_none(
+                    source_item.get("amount")
+                    or source_item.get("final_amount")
+                    or source_item.get("pdf_amount")
+                )
+            if qty is not None and rate is not None:
+                billed_amount = round(qty * rate, 2)
+
+            tieup_rate = _to_number_or_none(
+                item.get("tieup_rate")
+                or item.get("allowed_rate")
+                or item.get("matched_rate")
+                or source_item.get("tieup_rate")
+            )
+            allowed_amount = _to_number_or_none(item.get("allowed_amount"))
+            if tieup_rate is None and allowed_amount is not None and qty not in (None, 0):
+                tieup_rate = round(allowed_amount / qty, 2)
+
+            explicit_payable = None if has_edit else _pick_explicit_payable_amount(item, source_item)
+            if explicit_payable is not None:
+                amount_to_be_paid = explicit_payable
+            elif tieup_rate is not None and qty is not None:
+                amount_to_be_paid = round(tieup_rate * qty, 2)
+            elif allowed_amount is not None:
+                if billed_amount is not None:
+                    amount_to_be_paid = round(min(billed_amount, allowed_amount), 2)
+                else:
+                    amount_to_be_paid = round(allowed_amount, 2)
+            else:
+                amount_to_be_paid = None
+
+            line_items.append(
+                {
+                    "category_name": category_name,
+                    "item_index": item_index,
+                    "item_name": item_name,
+                    "bill_item": item_name,
+                    "best_match": _to_text_or_none(item.get("matched_item") or diagnostics.get("best_candidate")),
+                    "tieup_rate": tieup_rate,
+                    "qty": qty,
+                    "rate": rate,
+                    "billed_amount": billed_amount,
+                    "amount_to_be_paid": amount_to_be_paid,
+                    "extra_amount": _to_number_or_none(item.get("extra_amount")),
+                    "decision": (_to_text_or_none(item.get("status")) or "unknown").lower(),
+                }
+            )
+
+    return line_items
 
 
 def _parse_iso_datetime(value: Any) -> Optional[datetime]:
@@ -342,6 +652,20 @@ def _derive_dashboard_status(doc: dict[str, Any]) -> str:
     return upload_status
 
 
+def _normalize_queue_status(raw_status: Any) -> str:
+    normalized = _normalize_status(raw_status)
+    mapping = {
+        "uploaded": "UPLOADED",
+        "pending": "PENDING",
+        "processing": "PROCESSING",
+        "completed": "COMPLETED",
+        "verified": "COMPLETED",
+        "failed": "FAILED",
+        "not_found": "FAILED",
+    }
+    return mapping.get(normalized, str(raw_status or "PENDING").strip().upper() or "PENDING")
+
+
 def _server_now() -> datetime:
     """Server-local timezone aware current timestamp."""
     return datetime.now().astimezone()
@@ -350,12 +674,12 @@ def _server_now() -> datetime:
 def _parse_status_filter(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
-    normalized = _normalize_status(value)
-    allowed = {"pending", "processing", "completed"}
+    normalized = _normalize_queue_status(value)
+    allowed = {"PENDING", "PROCESSING", "COMPLETED", "FAILED", "UPLOADED"}
     if normalized not in allowed:
         raise HTTPException(
             status_code=400,
-            detail="status must be one of: PENDING, PROCESSING, COMPLETED",
+            detail="status must be one of: PENDING, PROCESSING, COMPLETED, FAILED, UPLOADED",
         )
     return normalized
 
@@ -433,10 +757,12 @@ def _build_bill_list_item(doc: dict[str, Any]) -> BillListItem:
         employee_id=employee_id,
         invoice_date=doc.get("invoice_date") or (doc.get("header", {}) or {}).get("billing_date"),
         upload_date=doc.get("upload_date") or doc.get("created_at"),
+        queue_position=doc.get("queue_position"),
+        processing_started_at=doc.get("processing_started_at"),
         processing_time_seconds=_derive_processing_time_seconds(doc),
         completed_at=doc.get("completed_at") or doc.get("processing_completed_at"),
         hospital_name=doc.get("hospital_name_metadata") or doc.get("hospital_name"),
-        status=_derive_dashboard_status(doc),
+        status=_normalize_queue_status(doc.get("status")),
         grand_total=float(doc.get("grand_total") or 0.0),
         page_count=doc.get("page_count"),
         original_filename=doc.get("original_filename") or doc.get("source_pdf"),
@@ -444,7 +770,7 @@ def _build_bill_list_item(doc: dict[str, Any]) -> BillListItem:
         created_at=doc.get("created_at"),
         updated_at=doc.get("updated_at"),
         is_deleted=is_deleted,
-        deleted_at=doc.get("deleted_at"),
+        deleted_at=_to_text_or_none(doc.get("deleted_at")),
         deleted_by=doc.get("deleted_by"),
     )
 
@@ -631,6 +957,7 @@ async def upload_bill(
             hospital_name=result["hospital_name"],
             message=result["message"],
             status=result["status"],
+            queue_position=result.get("queue_position"),
             page_count=result.get("page_count"),
             original_filename=result.get("original_filename"),
             file_size_bytes=result.get("file_size_bytes"),
@@ -680,7 +1007,7 @@ async def get_upload_status(upload_id: str):
                 file_size_bytes=None,
             )
 
-        normalized_status = _derive_dashboard_status(bill_doc)
+        normalized_status = _normalize_queue_status(bill_doc.get("status"))
 
         return StatusResponse(
             upload_id=upload_id,
@@ -691,6 +1018,10 @@ async def get_upload_status(upload_id: str):
             page_count=bill_doc.get("page_count"),
             original_filename=bill_doc.get("original_filename") or bill_doc.get("source_pdf"),
             file_size_bytes=bill_doc.get("file_size_bytes"),
+            queue_position=bill_doc.get("queue_position"),
+            processing_started_at=bill_doc.get("processing_started_at"),
+            completed_at=bill_doc.get("completed_at") or bill_doc.get("processing_completed_at"),
+            processing_time_seconds=_derive_processing_time_seconds(bill_doc),
         )
 
     except Exception as e:
@@ -708,7 +1039,8 @@ async def get_upload_status(upload_id: str):
 async def list_bills(
     limit: int = Query(50, ge=1, le=500, description="Maximum bills to return"),
     scope: str = Query("active", description="active | deleted"),
-    status: Optional[str] = Query(None, description="PENDING | PROCESSING | COMPLETED"),
+    status: Optional[str] = Query(None, description="UPLOADED | PENDING | PROCESSING | COMPLETED | FAILED"),
+    include_deleted: bool = Query(False, description="Include deleted bills in listing"),
     hospital_name: Optional[str] = Query(None, description="Case-insensitive exact hospital name"),
     date_filter: Optional[str] = Query(None, description="TODAY | YESTERDAY | THIS_MONTH | LAST_MONTH"),
 ):
@@ -728,6 +1060,7 @@ async def list_bills(
         limit=limit,
         scope=scope,
         status=status,
+        include_deleted=include_deleted,
         hospital_name=hospital_name,
         date_filter=date_filter,
     )
@@ -736,7 +1069,7 @@ async def list_bills(
 @router.get("/bills/deleted", response_model=list[BillListItem], status_code=200)
 async def list_deleted_bills(
     limit: int = Query(50, ge=1, le=500, description="Maximum bills to return"),
-    status: Optional[str] = Query(None, description="PENDING | PROCESSING | COMPLETED"),
+    status: Optional[str] = Query(None, description="UPLOADED | PENDING | PROCESSING | COMPLETED | FAILED"),
     hospital_name: Optional[str] = Query(None, description="Case-insensitive exact hospital name"),
     date_filter: Optional[str] = Query(None, description="TODAY | YESTERDAY | THIS_MONTH | LAST_MONTH"),
 ):
@@ -745,6 +1078,7 @@ async def list_deleted_bills(
         limit=limit,
         scope="deleted",
         status=status,
+        include_deleted=False,
         hospital_name=hospital_name,
         date_filter=date_filter,
     )
@@ -755,6 +1089,7 @@ async def _list_bills_common(
     limit: int,
     scope: str,
     status: Optional[str],
+    include_deleted: bool,
     hospital_name: Optional[str],
     date_filter: Optional[str],
 ) -> list[BillListItem]:
@@ -771,6 +1106,8 @@ async def _list_bills_common(
         from app.db.mongo_client import MongoDBClient
 
         requested_scope = _parse_scope(scope)
+        if include_deleted:
+            requested_scope = "all"
         requested_status = _parse_status_filter(status)
         date_start, date_end = _get_date_window(date_filter)
 
@@ -783,6 +1120,7 @@ async def _list_bills_common(
                 "employee_id": 1,
                 "invoice_date": 1,
                 "upload_date": 1,
+                "queue_position": 1,
                 "processing_time_seconds": 1,
                 "processing_started_at": 1,
                 "processing_completed_at": 1,
@@ -856,13 +1194,13 @@ async def delete_bill(
     upload_id: str,
     permanent: bool = Query(
         False,
-        description="If false: soft delete. If true: permanent delete (allowed only for soft-deleted bills).",
+        description="If false: soft delete. If true: permanent delete.",
     ),
     deleted_by: Optional[str] = Query(None, description="Optional actor id/email for audit"),
 ):
     """Delete a bill/upload with temporary or permanent semantics."""
     if not _is_valid_upload_id(upload_id):
-        raise HTTPException(status_code=400, detail="Invalid upload_id format")
+        _http_error(400, "INVALID_BILL_ID", "Invalid upload_id format")
 
     try:
         from app.db.mongo_client import MongoDBClient
@@ -870,32 +1208,40 @@ async def delete_bill(
         db = MongoDBClient(validate_schema=False)
         bill_doc = db.get_bill(upload_id)
         if not bill_doc:
-            raise HTTPException(status_code=404, detail="Bill not found")
+            _http_error(404, "BILL_NOT_FOUND", "Bill not found")
 
         is_deleted = bool(bill_doc.get("is_deleted") is True or bill_doc.get("deleted_at"))
 
         if permanent:
+            # Preferred behavior: auto soft-delete first, then hard-delete.
             if not is_deleted:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Permanent delete is allowed only for soft-deleted bills",
-                )
-            hard_delete = db.hard_delete_upload(upload_id)
+                db.soft_delete_upload(upload_id, deleted_by=deleted_by)
+                bill_doc = db.get_bill(upload_id) or bill_doc
+            hard_delete = db.permanent_delete_upload(upload_id, include_active=False)
             if hard_delete.get("deleted_count", 0) <= 0:
-                raise HTTPException(status_code=404, detail="Bill not found for permanent delete")
+                _http_error(
+                    404,
+                    "BILL_NOT_FOUND_FOR_PERMANENT_DELETE",
+                    "Bill not found for permanent delete",
+                )
             return DeleteBillResponse(
                 success=True,
                 upload_id=upload_id,
                 message="Bill permanently deleted",
-                deleted_at=bill_doc.get("deleted_at"),
+                deleted_at=_to_text_or_none(bill_doc.get("deleted_at")),
             )
 
         if is_deleted:
-            raise HTTPException(status_code=409, detail="Bill is already soft-deleted")
+            return DeleteBillResponse(
+                success=True,
+                upload_id=upload_id,
+                message="Bill already soft-deleted",
+                deleted_at=_to_text_or_none(bill_doc.get("deleted_at")),
+            )
 
         result = db.soft_delete_upload(upload_id, deleted_by=deleted_by)
-        if result["modified_count"] <= 0:
-            raise HTTPException(status_code=500, detail="Failed to soft-delete bill")
+        if int(result.get("modified_count", 0)) <= 0 and int(result.get("already_deleted_count", 0)) <= 0:
+            _http_error(500, "SOFT_DELETE_FAILED", "Failed to soft-delete bill")
         return DeleteBillResponse(
             success=True,
             upload_id=upload_id,
@@ -906,7 +1252,20 @@ async def delete_bill(
         raise
     except Exception as e:
         logger.error(f"Failed to delete bill {upload_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to delete bill: {str(e)}")
+        _http_error(500, "DELETE_BILL_FAILED", f"Failed to delete bill: {str(e)}")
+
+
+@router.delete("/bill/{upload_id}", response_model=DeleteBillResponse, status_code=200)
+async def delete_bill_legacy(
+    upload_id: str,
+    permanent: bool = Query(
+        False,
+        description="If false: soft delete. If true: permanent delete.",
+    ),
+    deleted_by: Optional[str] = Query(None, description="Optional actor id/email for audit"),
+):
+    """Legacy delete route with identical behavior to DELETE /bills/{upload_id}."""
+    return await delete_bill(upload_id=upload_id, permanent=permanent, deleted_by=deleted_by)
 
 
 @router.post("/bills/{upload_id}/restore", response_model=RestoreBillResponse, status_code=200)
@@ -968,6 +1327,16 @@ async def get_bill_details(bill_id: str):
         format_version = str(bill_doc.get("verification_format_version") or "").strip() or "legacy"
         verification_text = str(bill_doc.get("verification_result_text") or "").strip()
         verification_result = bill_doc.get("verification_result") or {}
+        stored_line_items = bill_doc.get("line_items")
+        if isinstance(stored_line_items, list) and stored_line_items:
+            line_items = [
+                _normalize_line_item_entry(raw_item)
+                for raw_item in stored_line_items
+                if isinstance(raw_item, dict)
+            ]
+        else:
+            line_items = _build_line_items_from_verification(bill_doc, verification_result)
+        should_backfill_line_items = not (isinstance(stored_line_items, list) and stored_line_items) and bool(line_items)
         financial_totals = {
             "total_billed": _as_float(verification_result.get("total_bill_amount"), 0.0),
             "total_allowed": _as_float(verification_result.get("total_allowed_amount"), 0.0),
@@ -984,9 +1353,18 @@ async def get_bill_details(bill_id: str):
                 upload_id=upload_id,
                 verification_result=verification_result,
                 verification_result_text=verification_text,
+                line_items=line_items,
                 format_version="v1",
             )
             format_version = "v1"
+        elif should_backfill_line_items and isinstance(verification_result, dict):
+            db.save_verification_result(
+                upload_id=upload_id,
+                verification_result=verification_result,
+                verification_result_text=verification_text,
+                line_items=line_items,
+                format_version=format_version,
+            )
 
         # Do not trigger verification from details endpoint. Verification is expected
         # to be handled by the upload processing pipeline.
@@ -1006,6 +1384,7 @@ async def get_bill_details(bill_id: str):
                 verificationResult="Verification is processing. Please retry shortly.",
                 formatVersion=format_version,
                 financial_totals=financial_totals,
+                line_items=line_items,
             )
         if not verification_text and status == "failed":
             return BillDetailResponse(
@@ -1023,6 +1402,7 @@ async def get_bill_details(bill_id: str):
                 verificationResult="Verification failed. Please retry from the dashboard.",
                 formatVersion=format_version,
                 financial_totals=financial_totals,
+                line_items=line_items,
             )
 
         return BillDetailResponse(
@@ -1040,6 +1420,7 @@ async def get_bill_details(bill_id: str):
             verificationResult=verification_text,
             formatVersion=format_version,
             financial_totals=financial_totals,
+            line_items=line_items,
         )
 
     except HTTPException:
@@ -1047,6 +1428,105 @@ async def get_bill_details(bill_id: str):
     except Exception as e:
         logger.error(f"Failed to fetch bill details for {bill_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to fetch bill details: {str(e)}")
+
+
+# ============================================================================
+# PATCH /bill/{upload_id}/line-items - Persist user edits for qty/rate
+# ============================================================================
+@router.patch("/bill/{upload_id}/line-items", response_model=LineItemsPatchResponse, status_code=200)
+async def patch_bill_line_items(upload_id: str, payload: LineItemsPatchRequest):
+    if not _is_valid_upload_id(upload_id):
+        raise HTTPException(status_code=400, detail="Invalid upload_id format")
+
+    try:
+        from app.db.mongo_client import MongoDBClient
+
+        db = MongoDBClient(validate_schema=False)
+        bill_doc = db.get_bill(upload_id)
+        if bill_doc and (bill_doc.get("is_deleted") is True or bill_doc.get("deleted_at")):
+            bill_doc = None
+        if not bill_doc:
+            raise HTTPException(status_code=404, detail=f"Bill not found with upload_id: {upload_id}")
+
+        verification_result = bill_doc.get("verification_result") or {}
+        if not isinstance(verification_result, dict) or not verification_result:
+            raise HTTPException(status_code=400, detail="Cannot edit line items before verification data is available")
+
+        category_counts = _category_item_counts(verification_result)
+        category_lookup = _category_name_lookup(verification_result)
+        existing_map = _line_item_edits_map(bill_doc.get("line_item_edits"))
+
+        seen_keys: set[tuple[str, int]] = set()
+        for entry in payload.line_items:
+            category_key = entry.category_name.casefold()
+            if category_key not in category_counts:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid category_name '{entry.category_name}'. Category not found.",
+                )
+            max_count = category_counts[category_key]
+            if entry.item_index >= max_count:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid item_index {entry.item_index} for category '{entry.category_name}'.",
+                )
+            key = (category_key, entry.item_index)
+            if key in seen_keys:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Duplicate edit for category '{entry.category_name}' index {entry.item_index}.",
+                )
+            seen_keys.add(key)
+
+        edited_at = datetime.now().isoformat()
+        edited_by = payload.edited_by
+        for entry in payload.line_items:
+            category_key = entry.category_name.casefold()
+            canonical_category = category_lookup.get(category_key, entry.category_name)
+            key = (category_key, entry.item_index)
+            current = existing_map.get(key, {})
+            qty_value = entry.qty if entry.qty is not None else _to_number_or_none(current.get("qty"))
+            rate_value = entry.rate if entry.rate is not None else _to_number_or_none(current.get("rate"))
+            existing_map[key] = {
+                "category_name": canonical_category,
+                "item_index": entry.item_index,
+                "qty": qty_value,
+                "rate": rate_value,
+                "edited_at": edited_at,
+                "edited_by": edited_by,
+            }
+
+        persisted_edits = list(existing_map.values())
+        recompute_doc = dict(bill_doc)
+        recompute_doc["line_item_edits"] = persisted_edits
+        line_items = _build_line_items_from_verification(recompute_doc, verification_result)
+
+        db.save_line_item_edits(
+            upload_id=upload_id,
+            line_item_edits=persisted_edits,
+            line_items=line_items,
+            edited_at=edited_at,
+            edited_by=edited_by,
+        )
+
+        return LineItemsPatchResponse(
+            upload_id=upload_id,
+            edited_at=edited_at,
+            edited_by=edited_by,
+            line_items=line_items,
+        )
+
+    except HTTPException:
+        raise
+    except ValidationError as exc:
+        first_error = exc.errors()[0] if exc.errors() else {}
+        message = first_error.get("msg") or "Invalid line item edit payload"
+        if isinstance(message, str) and message.startswith("Value error, "):
+            message = message.replace("Value error, ", "", 1)
+        raise HTTPException(status_code=400, detail=message)
+    except Exception as e:
+        logger.error(f"Failed to patch line items for {upload_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to patch line items: {str(e)}")
 
 
 # ============================================================================
@@ -1110,10 +1590,12 @@ async def verify_bill(
             hospital_name=effective_hospital_name
         )
         verification_result_text = _format_verification_result_text(verification_result)
+        line_items = _build_line_items_from_verification(bill_doc, verification_result)
         db.save_verification_result(
             upload_id=upload_id,
             verification_result=verification_result,
             verification_result_text=verification_result_text,
+            line_items=line_items,
             format_version="v1",
         )
         

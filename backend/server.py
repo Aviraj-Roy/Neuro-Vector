@@ -78,12 +78,16 @@ async def startup_event():
     
     try:
         from app.utils.dependency_check import check_all_dependencies, check_external_tools
+        from app.services.upload_pipeline import start_queue_worker
+        from app.services.bill_retention import start_bill_retention_worker
         
         # Check Python dependencies
         check_all_dependencies()
         
         # Check external tools (MongoDB, Ollama, etc.) - warnings only
         check_external_tools()
+        start_queue_worker()
+        start_bill_retention_worker()
         
         logger.info("✅ All startup checks passed. API server ready.")
         logger.info(f"📚 API Documentation: http://localhost:8001/docs")

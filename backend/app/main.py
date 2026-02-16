@@ -112,7 +112,8 @@ def process_bill(
     hospital_name: str,  # NEW: Required parameter for hospital selection
     upload_id: str | None = None, 
     original_filename: str | None = None,
-    auto_cleanup: bool = True
+    auto_cleanup: bool = True,
+    assume_processing_claimed: bool = False,
 ) -> str:
     """Process a medical bill PDF and persist ONE MongoDB document.
 
@@ -152,20 +153,21 @@ def process_bill(
     db = MongoDBClient(validate_schema=False)
 
     # Atomic lifecycle transition to avoid duplicate processing for same upload_id.
-    acquired = db.mark_processing(upload_id)
-    if not acquired:
-        current = db.get_bill(upload_id) or {}
-        current_status = str(current.get("status") or "").lower()
-        if current_status == "completed":
-            logger.info(f"Upload already completed; skipping reprocessing: {upload_id}")
-            return upload_id
-        if current_status == "processing":
-            logger.info(f"Upload is already being processed by another worker: {upload_id}")
-            return upload_id
-        raise RuntimeError(
-            f"Cannot transition upload to processing for upload_id={upload_id}. "
-            f"Current status={current_status or 'unknown'}"
-        )
+    if not assume_processing_claimed:
+        acquired = db.mark_processing(upload_id)
+        if not acquired:
+            current = db.get_bill(upload_id) or {}
+            current_status = str(current.get("status") or "").lower()
+            if current_status == "completed":
+                logger.info(f"Upload already completed; skipping reprocessing: {upload_id}")
+                return upload_id
+            if current_status == "processing":
+                logger.info(f"Upload is already being processed by another worker: {upload_id}")
+                return upload_id
+            raise RuntimeError(
+                f"Cannot transition upload to processing for upload_id={upload_id}. "
+                f"Current status={current_status or 'unknown'}"
+            )
 
     try:
         # 1) Convert ALL pages to images

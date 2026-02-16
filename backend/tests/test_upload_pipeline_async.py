@@ -43,7 +43,8 @@ class FakeMongoDBClient:
         doc = {
             "_id": upload_id,
             "upload_id": upload_id,
-            "status": "uploaded",
+            "status": "PENDING",
+            "queue_position": 1,
             "employee_id": employee_id,
             "hospital_name": hospital_name,
             "original_filename": original_filename,
@@ -56,7 +57,18 @@ class FakeMongoDBClient:
             doc["ingestion_request_id"] = ingestion_request_id
             FakeMongoDBClient.docs_by_request_id[ingestion_request_id] = doc
         FakeMongoDBClient.docs_by_upload_id[upload_id] = doc
-        return {"upload_id": upload_id, "created": True, "status": "uploaded"}
+        return {"upload_id": upload_id, "created": True, "status": "PENDING"}
+
+    def enqueue_upload_job(self, *, upload_id: str, temp_pdf_path: str, hospital_name: str, original_filename: str):
+        doc = FakeMongoDBClient.docs_by_upload_id.get(upload_id)
+        if not doc:
+            return False
+        doc["status"] = "PENDING"
+        doc["temp_pdf_path"] = temp_pdf_path
+        doc["queue_hospital_name"] = hospital_name
+        doc["queue_original_filename"] = original_filename
+        doc["queue_position"] = doc.get("queue_position") or 1
+        return True
 
     def get_bill(self, upload_id: str) -> Optional[Dict[str, Any]]:
         return FakeMongoDBClient.docs_by_upload_id.get(upload_id)
@@ -99,7 +111,7 @@ def test_upload_pipeline_returns_uploaded_and_starts_background(monkeypatch, tmp
         )
     )
 
-    assert result["status"] == "uploaded"
+    assert result["status"] == "PENDING"
     assert result["upload_id"]
     assert result["employee_id"] == "12345678"
     assert result["invoice_date"] == "2026-02-14"
@@ -114,7 +126,7 @@ def test_upload_pipeline_idempotency_returns_existing_processing(monkeypatch, tm
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
             "_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "upload_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "status": "processing",
+            "status": "PROCESSING",
             "employee_id": "12345678",
             "original_filename": "bill.pdf",
             "file_size_bytes": 12,
@@ -141,6 +153,6 @@ def test_upload_pipeline_idempotency_returns_existing_processing(monkeypatch, tm
 
     assert result["existing"] is True
     assert result["upload_id"] == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    assert result["status"] == "processing"
+    assert result["status"] == "PROCESSING"
     assert FakeMongoDBClient.create_calls == 0
     assert FakeThread.started == 0

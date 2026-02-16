@@ -223,6 +223,38 @@ def test_extraction_pipeline():
     print("  ✓ Extraction pipeline working")
 
 
+def test_extraction_includes_qty_rate_alias_fields():
+    """Ensure extracted items expose both legacy and normalized qty/rate keys."""
+    ocr_result = {
+        "raw_text": "",
+        "lines": [
+            {"text": "S.No", "page": 0, "box": [[0, 100], [50, 100], [50, 110], [0, 110]], "confidence": 0.9},
+        ],
+        "item_blocks": [
+            {
+                "text": "1 TEST ITEM 2 150.50 301.00",
+                "description": "TEST ITEM",
+                "columns": ["2", "150.50", "301.00"],
+                "page": 0,
+                "y": 200.0,
+            },
+        ],
+    }
+    result = extract_bill_data(ocr_result)
+    extracted = []
+    for _, items in result["items"].items():
+        extracted.extend(items)
+    assert extracted, "No items extracted"
+    item = next((x for x in extracted if "description" in x), None)
+    assert item is not None, "No real extracted bill item found"
+    assert "qty" in item
+    assert "quantity" in item
+    assert "unit_rate" in item
+    assert "rate" in item
+    assert item["qty"] == item["quantity"]
+    assert item["unit_rate"] == item["rate"]
+
+
 def test_header_not_in_items():
     """Test that header labels don't appear as items."""
     print("Testing header leakage prevention...")

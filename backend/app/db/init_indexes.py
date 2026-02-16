@@ -115,6 +115,11 @@ def ensure_indexes() -> None:
             sparse=True,
         ),
         IndexSpec(
+            name="idx_is_deleted_deleted_at",
+            keys=[("is_deleted", ASCENDING), ("deleted_at", ASCENDING)],
+            sparse=True,
+        ),
+        IndexSpec(
             name="idx_ingestion_request_id_unique",
             keys=[("ingestion_request_id", ASCENDING)],
             unique=True,
