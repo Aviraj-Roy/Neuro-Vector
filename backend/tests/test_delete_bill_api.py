@@ -396,6 +396,80 @@ def test_filters_combined_with_scope(monkeypatch):
     assert rows[0]["employee_id"] == "88888888"
 
 
+def test_bills_completed_but_details_not_ready_is_processing(monkeypatch):
+    bill_id = "ab" * 16
+    docs = [
+        {
+            "_id": bill_id,
+            "upload_id": bill_id,
+            "employee_id": "12125555",
+            "status": "completed",
+            "verification_status": "completed",
+            "details_ready": False,
+            "updated_at": "2026-02-16T10:00:00",
+        }
+    ]
+    client = _build_client(monkeypatch, docs)
+
+    resp = client.get("/bills?scope=active")
+    assert resp.status_code == 200
+    rows = resp.json()
+    assert len(rows) == 1
+    assert rows[0]["status"] == "PROCESSING"
+    assert rows[0]["details_ready"] is False
+    assert rows[0]["processing_stage"] == "FORMAT_RESULT"
+
+
+def test_bills_completed_and_details_ready_is_completed(monkeypatch):
+    bill_id = "bc" * 16
+    docs = [
+        {
+            "_id": bill_id,
+            "upload_id": bill_id,
+            "employee_id": "12126666",
+            "status": "completed",
+            "verification_status": "completed",
+            "details_ready": True,
+            "updated_at": "2026-02-16T11:00:00",
+        }
+    ]
+    client = _build_client(monkeypatch, docs)
+
+    resp = client.get("/bills?scope=active")
+    assert resp.status_code == 200
+    rows = resp.json()
+    assert len(rows) == 1
+    assert rows[0]["status"] == "COMPLETED"
+    assert rows[0]["details_ready"] is True
+    assert rows[0]["processing_stage"] == "DONE"
+
+
+def test_deleted_scope_status_filter_respects_derived_processing(monkeypatch):
+    target_id = "cd" * 16
+    docs = [
+        {
+            "_id": target_id,
+            "upload_id": target_id,
+            "employee_id": "45454545",
+            "status": "completed",
+            "verification_status": "completed",
+            "details_ready": "false",
+            "is_deleted": True,
+            "deleted_at": "2026-02-16T11:30:00",
+            "updated_at": "2026-02-16T11:30:00",
+        }
+    ]
+    client = _build_client(monkeypatch, docs)
+
+    resp = client.get("/bills/deleted?status=PROCESSING")
+    assert resp.status_code == 200
+    rows = resp.json()
+    assert len(rows) == 1
+    assert rows[0]["bill_id"] == target_id
+    assert rows[0]["status"] == "PROCESSING"
+    assert rows[0]["details_ready"] is False
+
+
 def test_invalid_transitions(monkeypatch):
     active_id = "4" * 32
     deleted_id = "5" * 32

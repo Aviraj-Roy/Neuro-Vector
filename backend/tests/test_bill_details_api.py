@@ -285,8 +285,52 @@ def test_get_bill_returns_processing_while_on_demand_verification_runs(monkeypat
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "processing"
+    assert body["details_ready"] is False
     assert "Verification is processing" in body["verificationResult"]
     assert FakeMongoDBClient.verification_marked is False
+
+
+def test_get_bill_not_ready_returns_processing_message_even_with_text(monkeypatch):
+    bill_id = "12121212121212121212121212121212"
+    doc = {
+        "_id": bill_id,
+        "upload_id": bill_id,
+        "status": "completed",
+        "verification_status": "completed",
+        "details_ready": "0",
+        "verification_result_text": "Overall Summary\nTotal Items: 99",
+        "verification_format_version": "v1",
+    }
+    client = _build_client(monkeypatch, doc)
+
+    resp = client.get(f"/bill/{bill_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "processing"
+    assert body["details_ready"] is False
+    assert "Verification is processing" in body["verificationResult"]
+    assert body["line_items"] == []
+    assert FakeMongoDBClient.saved_payload is None
+
+
+def test_get_bill_ready_returns_details_ready_true(monkeypatch):
+    bill_id = "13131313131313131313131313131313"
+    doc = {
+        "_id": bill_id,
+        "upload_id": bill_id,
+        "status": "completed",
+        "verification_status": "completed",
+        "details_ready": True,
+        "verification_result_text": "Overall Summary\nTotal Items: 1",
+        "verification_format_version": "v1",
+    }
+    client = _build_client(monkeypatch, doc)
+
+    resp = client.get(f"/bill/{bill_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "completed"
+    assert body["details_ready"] is True
 
 
 def test_get_bill_returns_failed_when_verification_failed(monkeypatch):

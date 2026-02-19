@@ -155,6 +155,11 @@ class StatusResponse(BaseModel):
     processing_started_at: Optional[str] = Field(None, description="When processing actually started")
     completed_at: Optional[str] = Field(None, description="Completion timestamp for terminal states")
     processing_time_seconds: Optional[float] = Field(None, description="Derived processing duration in seconds")
+    details_ready: bool = Field(False, description="Whether bill details/verification output are fully ready")
+    processing_stage: Optional[str] = Field(
+        None,
+        description="Pipeline stage: OCR | EXTRACTION | LLM_VERIFY | FORMAT_RESULT | DONE | FAILED",
+    )
 
     class Config:
         json_schema_extra = {
@@ -199,6 +204,8 @@ class BillListItem(BaseModel):
     is_deleted: bool = False
     deleted_at: Optional[str] = None
     deleted_by: Optional[str] = None
+    details_ready: bool = False
+    processing_stage: Optional[str] = None
 
 
 class DeleteBillResponse(BaseModel):
@@ -283,6 +290,10 @@ class BillDetailResponse(BaseModel):
     billId: str = Field(..., description="Bill identifier (same as upload_id)")
     upload_id: str = Field(..., description="Upload identifier")
     status: str = Field(..., description="Current processing status")
+    details_ready: bool = Field(
+        False,
+        description="Whether full structured verification details are ready",
+    )
     hospital_name: Optional[str] = Field(
         None,
         description="Hospital name metadata (if available)",
@@ -642,14 +653,79 @@ def _derive_dashboard_status(doc: dict[str, Any]) -> str:
     if verification_status in {"processing", "pending"}:
         return "processing"
     if verification_status in {"completed", "verified"}:
-        return "completed"
+        return "completed" if _is_bill_details_ready(doc) else "processing"
+
+    if upload_status in {"completed", "verified"} and not _is_bill_details_ready(doc):
+        return "processing"
+    return upload_status
+
+
+def _derive_processing_stage(doc: dict[str, Any]) -> str:
+    """Map upload + verification lifecycle into a UX-friendly pipeline stage."""
+    upload_status = _normalize_status(doc.get("status"))
+    raw_verification_status = str(doc.get("verification_status") or "").strip()
+    verification_status = (
+        _normalize_status(raw_verification_status) if raw_verification_status else ""
+    )
+    details_ready = _is_bill_details_ready(doc)
+    dashboard_status = _derive_dashboard_status(doc)
+
+    if upload_status == "failed" or verification_status == "failed" or dashboard_status == "failed":
+        return "FAILED"
+    if dashboard_status == "completed" and details_ready:
+        return "DONE"
+    if verification_status in {"pending", "processing"}:
+        return "LLM_VERIFY"
+    if verification_status in {"completed", "verified"} and not details_ready:
+        return "FORMAT_RESULT"
+    if upload_status in {"completed", "verified"} and not details_ready:
+        return "FORMAT_RESULT"
+    if upload_status == "processing":
+        return "EXTRACTION"
+    if upload_status in {"pending", "uploaded"}:
+        return "OCR"
+    return "OCR"
+
+
+def _is_bill_details_ready(doc: dict[str, Any]) -> bool:
+    """Single source of truth for whether detail payload is fully ready."""
+    explicit_flags = [
+        doc.get("details_ready"),
+        doc.get("result_ready"),
+        doc.get("is_result_ready"),
+        doc.get("has_verification_result"),
+    ]
+    for value in explicit_flags:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            if int(value) == 1:
+                return True
+            if int(value) == 0:
+                return False
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "y"}:
+                return True
+            if normalized in {"false", "0", "no", "n", ""}:
+                return False
 
     has_verification_text = bool(str(doc.get("verification_result_text") or "").strip())
     verification_result = doc.get("verification_result")
     has_verification_payload = isinstance(verification_result, dict) and bool(verification_result)
-    if upload_status in {"completed", "verified"} and not (has_verification_text or has_verification_payload):
-        return "processing"
-    return upload_status
+    has_verification_keys = (
+        "verification_status" in doc
+        or "verification_result_text" in doc
+        or "verification_result" in doc
+    )
+    if has_verification_text or has_verification_payload:
+        return True
+    # Keep legacy sparse records compatible: if no verification fields exist at all,
+    # treat completed uploads as ready to avoid rewriting old data assumptions.
+    if not has_verification_keys:
+        status = _normalize_status(doc.get("status"))
+        return status in {"completed", "verified"}
+    return False
 
 
 def _normalize_queue_status(raw_status: Any) -> str:
@@ -752,6 +828,9 @@ def _build_bill_list_item(doc: dict[str, Any]) -> BillListItem:
     is_deleted = bool(doc.get("is_deleted") is True or doc.get("deleted_at"))
     employee_id = str(doc.get("employee_id") or "").strip()
     bill_id = str(doc.get("_id") or doc.get("upload_id") or "").strip()
+    dashboard_status = _normalize_queue_status(_derive_dashboard_status(doc))
+    details_ready = _is_bill_details_ready(doc)
+    processing_stage = _derive_processing_stage(doc)
     return BillListItem(
         bill_id=bill_id,
         employee_id=employee_id,
@@ -762,7 +841,7 @@ def _build_bill_list_item(doc: dict[str, Any]) -> BillListItem:
         processing_time_seconds=_derive_processing_time_seconds(doc),
         completed_at=doc.get("completed_at") or doc.get("processing_completed_at"),
         hospital_name=doc.get("hospital_name_metadata") or doc.get("hospital_name"),
-        status=_normalize_queue_status(doc.get("status")),
+        status=dashboard_status,
         grand_total=float(doc.get("grand_total") or 0.0),
         page_count=doc.get("page_count"),
         original_filename=doc.get("original_filename") or doc.get("source_pdf"),
@@ -772,6 +851,8 @@ def _build_bill_list_item(doc: dict[str, Any]) -> BillListItem:
         is_deleted=is_deleted,
         deleted_at=_to_text_or_none(doc.get("deleted_at")),
         deleted_by=doc.get("deleted_by"),
+        details_ready=details_ready,
+        processing_stage=processing_stage,
     )
 
 
@@ -1007,7 +1088,9 @@ async def get_upload_status(upload_id: str):
                 file_size_bytes=None,
             )
 
-        normalized_status = _normalize_queue_status(bill_doc.get("status"))
+        normalized_status = _normalize_queue_status(_derive_dashboard_status(bill_doc))
+        details_ready = _is_bill_details_ready(bill_doc)
+        processing_stage = _derive_processing_stage(bill_doc)
 
         return StatusResponse(
             upload_id=upload_id,
@@ -1022,6 +1105,8 @@ async def get_upload_status(upload_id: str):
             processing_started_at=bill_doc.get("processing_started_at"),
             completed_at=bill_doc.get("completed_at") or bill_doc.get("processing_completed_at"),
             processing_time_seconds=_derive_processing_time_seconds(bill_doc),
+            details_ready=details_ready,
+            processing_stage=processing_stage,
         )
 
     except Exception as e:
@@ -1133,6 +1218,10 @@ async def _list_bills_common(
                 "verification_status": 1,
                 "verification_result_text": 1,
                 "verification_result": 1,
+                "details_ready": 1,
+                "result_ready": 1,
+                "is_result_ready": 1,
+                "has_verification_result": 1,
                 "grand_total": 1,
                 "page_count": 1,
                 "original_filename": 1,
@@ -1323,6 +1412,7 @@ async def get_bill_details(bill_id: str):
 
         upload_id = str(bill_doc.get("upload_id") or bill_doc.get("_id") or bill_id)
         status = _derive_dashboard_status(bill_doc)
+        details_ready = _is_bill_details_ready(bill_doc)
         hospital_name = bill_doc.get("hospital_name_metadata") or bill_doc.get("hospital_name")
         format_version = str(bill_doc.get("verification_format_version") or "").strip() or "legacy"
         verification_text = str(bill_doc.get("verification_result_text") or "").strip()
@@ -1343,6 +1433,48 @@ async def get_bill_details(bill_id: str):
             "total_extra": _as_float(verification_result.get("total_extra_amount"), 0.0),
             "total_unclassified": _as_float(verification_result.get("total_unclassified_amount"), 0.0),
         }
+
+        # Do not trigger verification from details endpoint. Verification is expected
+        # to be handled by the upload processing pipeline.
+        if status == "failed":
+            return BillDetailResponse(
+                billId=upload_id,
+                upload_id=upload_id,
+                employee_id=str(bill_doc.get("employee_id") or "").strip(),
+                status="failed",
+                details_ready=details_ready,
+                hospital_name=hospital_name,
+                invoice_date=bill_doc.get("invoice_date") or (bill_doc.get("header", {}) or {}).get("billing_date"),
+                upload_date=bill_doc.get("upload_date") or bill_doc.get("created_at"),
+                created_at=bill_doc.get("created_at"),
+                updated_at=bill_doc.get("updated_at"),
+                is_deleted=False,
+                deleted_at=None,
+                verificationResult="Verification failed. Please retry from the dashboard.",
+                formatVersion=format_version,
+                financial_totals=financial_totals,
+                line_items=[],
+            )
+
+        if not details_ready:
+            return BillDetailResponse(
+                billId=upload_id,
+                upload_id=upload_id,
+                employee_id=str(bill_doc.get("employee_id") or "").strip(),
+                status="processing",
+                details_ready=False,
+                hospital_name=hospital_name,
+                invoice_date=bill_doc.get("invoice_date") or (bill_doc.get("header", {}) or {}).get("billing_date"),
+                upload_date=bill_doc.get("upload_date") or bill_doc.get("created_at"),
+                created_at=bill_doc.get("created_at"),
+                updated_at=bill_doc.get("updated_at"),
+                is_deleted=False,
+                deleted_at=None,
+                verificationResult="Verification is processing. Please retry shortly.",
+                formatVersion=format_version,
+                financial_totals=financial_totals,
+                line_items=[],
+            )
 
         # Regenerate parser-safe text when:
         # - text is missing
@@ -1366,50 +1498,12 @@ async def get_bill_details(bill_id: str):
                 format_version=format_version,
             )
 
-        # Do not trigger verification from details endpoint. Verification is expected
-        # to be handled by the upload processing pipeline.
-        if not verification_text and status == "processing":
-            return BillDetailResponse(
-                billId=upload_id,
-                upload_id=upload_id,
-                employee_id=str(bill_doc.get("employee_id") or "").strip(),
-                status="processing",
-                hospital_name=hospital_name,
-                invoice_date=bill_doc.get("invoice_date") or (bill_doc.get("header", {}) or {}).get("billing_date"),
-                upload_date=bill_doc.get("upload_date") or bill_doc.get("created_at"),
-                created_at=bill_doc.get("created_at"),
-                updated_at=bill_doc.get("updated_at"),
-                is_deleted=False,
-                deleted_at=None,
-                verificationResult="Verification is processing. Please retry shortly.",
-                formatVersion=format_version,
-                financial_totals=financial_totals,
-                line_items=line_items,
-            )
-        if not verification_text and status == "failed":
-            return BillDetailResponse(
-                billId=upload_id,
-                upload_id=upload_id,
-                employee_id=str(bill_doc.get("employee_id") or "").strip(),
-                status="failed",
-                hospital_name=hospital_name,
-                invoice_date=bill_doc.get("invoice_date") or (bill_doc.get("header", {}) or {}).get("billing_date"),
-                upload_date=bill_doc.get("upload_date") or bill_doc.get("created_at"),
-                created_at=bill_doc.get("created_at"),
-                updated_at=bill_doc.get("updated_at"),
-                is_deleted=False,
-                deleted_at=None,
-                verificationResult="Verification failed. Please retry from the dashboard.",
-                formatVersion=format_version,
-                financial_totals=financial_totals,
-                line_items=line_items,
-            )
-
         return BillDetailResponse(
             billId=upload_id,
             upload_id=upload_id,
             employee_id=str(bill_doc.get("employee_id") or "").strip(),
             status=status,
+            details_ready=details_ready,
             hospital_name=hospital_name,
             invoice_date=bill_doc.get("invoice_date") or (bill_doc.get("header", {}) or {}).get("billing_date"),
             upload_date=bill_doc.get("upload_date") or bill_doc.get("created_at"),

@@ -70,3 +70,57 @@ def test_status_processing_exposes_processing_started(monkeypatch):
     body = resp.json()
     assert body["status"] == "PROCESSING"
     assert body["processing_started_at"] == "2026-02-16T10:05:00"
+
+
+def test_status_completed_but_not_ready_reports_processing(monkeypatch):
+    upload_id = "b2" * 16
+    doc = {
+        "_id": upload_id,
+        "upload_id": upload_id,
+        "status": "completed",
+        "verification_status": "completed",
+        "details_ready": False,
+    }
+    client = _build_client(monkeypatch, doc)
+    resp = client.get(f"/status/{upload_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "PROCESSING"
+    assert body["details_ready"] is False
+    assert body["processing_stage"] == "FORMAT_RESULT"
+
+
+def test_status_completed_and_ready_reports_completed(monkeypatch):
+    upload_id = "c3" * 16
+    doc = {
+        "_id": upload_id,
+        "upload_id": upload_id,
+        "status": "completed",
+        "verification_status": "completed",
+        "details_ready": True,
+    }
+    client = _build_client(monkeypatch, doc)
+    resp = client.get(f"/status/{upload_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "COMPLETED"
+    assert body["details_ready"] is True
+    assert body["processing_stage"] == "DONE"
+
+
+def test_status_string_false_flag_treated_as_false(monkeypatch):
+    upload_id = "d4" * 16
+    doc = {
+        "_id": upload_id,
+        "upload_id": upload_id,
+        "status": "completed",
+        "verification_status": "completed",
+        "details_ready": "0",
+        "verification_result_text": "Overall Summary\nTotal Items: 1",
+    }
+    client = _build_client(monkeypatch, doc)
+    resp = client.get(f"/status/{upload_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["details_ready"] is False
+    assert body["status"] == "PROCESSING"
