@@ -278,6 +278,10 @@ class BillLineItem(BaseModel):
     tieup_rate: Optional[float] = Field(None, description="Tie-up per-unit/fixed rate")
     qty: Optional[float] = Field(None, description="Extracted quantity")
     rate: Optional[float] = Field(None, description="Extracted billed unit rate")
+    final_amount: float = Field(
+        0.0,
+        description="Final billed line amount sourced from MongoDB/extraction",
+    )
     billed_amount: Optional[float] = Field(None, description="Billed line amount")
     amount_to_be_paid: Optional[float] = Field(
         None,
@@ -497,6 +501,12 @@ def _line_item_edits_map(
 def _normalize_line_item_entry(raw_item: dict[str, Any]) -> dict[str, Any]:
     item_name = _to_text_or_none(raw_item.get("item_name") or raw_item.get("bill_item")) or "N/A"
     decision = _to_text_or_none(raw_item.get("decision") or raw_item.get("status")) or "unknown"
+    final_amount = _to_number_or_none(
+        raw_item.get("final_amount")
+        if raw_item.get("final_amount") is not None
+        else raw_item.get("billed_amount")
+    )
+    final_amount = final_amount if final_amount is not None else 0.0
     return {
         "category_name": _to_text_or_none(raw_item.get("category_name")),
         "item_index": (
@@ -510,7 +520,8 @@ def _normalize_line_item_entry(raw_item: dict[str, Any]) -> dict[str, Any]:
         "tieup_rate": _to_number_or_none(raw_item.get("tieup_rate")),
         "qty": _to_number_or_none(raw_item.get("qty")),
         "rate": _to_number_or_none(raw_item.get("rate")),
-        "billed_amount": _to_number_or_none(raw_item.get("billed_amount")),
+        "final_amount": final_amount,
+        "billed_amount": final_amount,
         "amount_to_be_paid": _to_number_or_none(raw_item.get("amount_to_be_paid")),
         "discrepancy": _to_bool_or_none(raw_item.get("discrepancy")),
         "extra_amount": _to_number_or_none(raw_item.get("extra_amount")),
@@ -580,15 +591,21 @@ def _build_line_items_from_verification(
             if has_edit and edit_entry.get("rate") is not None:
                 rate = _to_number_or_none(edit_entry.get("rate"))
 
-            billed_amount = _to_number_or_none(item.get("billed_amount") or item.get("bill_amount"))
-            if billed_amount is None:
-                billed_amount = _to_number_or_none(
+            final_amount = _to_number_or_none(item.get("final_amount"))
+            if final_amount is None:
+                final_amount = _to_number_or_none(source_item.get("final_amount"))
+            if final_amount is None:
+                final_amount = _to_number_or_none(item.get("billed_amount") or item.get("bill_amount"))
+            if final_amount is None:
+                final_amount = _to_number_or_none(
                     source_item.get("amount")
-                    or source_item.get("final_amount")
+                    or source_item.get("billed_amount")
                     or source_item.get("pdf_amount")
                 )
-            if qty is not None and rate is not None:
-                billed_amount = round(qty * rate, 2)
+            if final_amount is None and qty is not None and rate is not None:
+                # Last-resort fallback for sparse legacy payloads without explicit line totals.
+                final_amount = round(qty * rate, 2)
+            billed_amount = final_amount
 
             tieup_rate = _to_number_or_none(
                 item.get("tieup_rate")
@@ -614,6 +631,7 @@ def _build_line_items_from_verification(
                     amount_to_be_paid = round(allowed_amount, 2)
             else:
                 amount_to_be_paid = None
+            final_amount_out = final_amount if final_amount is not None else 0.0
 
             line_items.append(
                 {
@@ -625,7 +643,8 @@ def _build_line_items_from_verification(
                     "tieup_rate": tieup_rate,
                     "qty": qty,
                     "rate": rate,
-                    "billed_amount": billed_amount,
+                    "final_amount": final_amount_out,
+                    "billed_amount": final_amount_out,
                     "amount_to_be_paid": amount_to_be_paid,
                     "discrepancy": _to_bool_or_none(
                         item.get("discrepancy") if item.get("discrepancy") is not None else source_item.get("discrepancy")

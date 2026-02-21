@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import certifi
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo import ReturnDocument
@@ -17,6 +18,39 @@ from pymongo.errors import DuplicateKeyError
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+def _build_mongo_client_kwargs(mongo_uri: str) -> Dict[str, Any]:
+    """Build MongoClient kwargs with sane TLS defaults for Atlas/Windows."""
+    kwargs: Dict[str, Any] = {
+        "serverSelectionTimeoutMS": int(os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "10000")),
+        "connectTimeoutMS": int(os.getenv("MONGO_CONNECT_TIMEOUT_MS", "10000")),
+        "socketTimeoutMS": int(os.getenv("MONGO_SOCKET_TIMEOUT_MS", "20000")),
+    }
+
+    uri_lower = (mongo_uri or "").lower()
+    tls_expected = (
+        mongo_uri.startswith("mongodb+srv://")
+        or "tls=true" in uri_lower
+        or "ssl=true" in uri_lower
+    )
+
+    if tls_expected:
+        ca_file = (
+            os.getenv("MONGO_TLS_CA_FILE")
+            or os.getenv("SSL_CERT_FILE")
+            or certifi.where()
+        )
+        kwargs["tlsCAFile"] = ca_file
+
+    if os.getenv("MONGO_TLS_ALLOW_INVALID_CERTIFICATES", "false").strip().lower() == "true":
+        logger.warning(
+            "MONGO_TLS_ALLOW_INVALID_CERTIFICATES=true is enabled. "
+            "This weakens TLS security and should only be used for local troubleshooting."
+        )
+        kwargs["tlsAllowInvalidCertificates"] = True
+
+    return kwargs
 
 
 class MongoDBClient:
@@ -127,7 +161,7 @@ class MongoDBClient:
         if not mongo_uri:
             raise ValueError("MONGO_URI not found in .env")
 
-        self.client = MongoClient(mongo_uri)
+        self.client = MongoClient(mongo_uri, **_build_mongo_client_kwargs(mongo_uri))
         MongoDBClient._client = self.client
 
         self.db = self.client[db_name]

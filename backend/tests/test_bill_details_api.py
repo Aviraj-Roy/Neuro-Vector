@@ -179,6 +179,8 @@ def test_get_bill_formats_from_structured_verification_result(monkeypatch):
     assert line_items[0]["tieup_rate"] == 50.0
     assert line_items[0]["qty"] == 2.0
     assert line_items[0]["rate"] == 50.0
+    assert isinstance(line_items[0]["final_amount"], (int, float))
+    assert line_items[0]["final_amount"] == 100.0
     assert line_items[0]["billed_amount"] == 100.0
     assert line_items[0]["amount_to_be_paid"] == 100.0
     assert line_items[0]["extra_amount"] == 0.0
@@ -392,6 +394,8 @@ def test_build_line_items_maps_all_new_fields():
     assert item["tieup_rate"] == 11.0
     assert item["qty"] == 3.0
     assert item["rate"] == 12.0
+    assert isinstance(item["final_amount"], (int, float))
+    assert item["final_amount"] == 36.0
     assert item["billed_amount"] == 36.0
     assert item["amount_to_be_paid"] == 30.0
     assert item["extra_amount"] == 6.0
@@ -441,6 +445,8 @@ def test_get_bill_line_items_missing_qty_rate_tieup_regression(monkeypatch):
     assert item["rate"] is None
     assert item["tieup_rate"] is None
     assert item["amount_to_be_paid"] is None
+    assert isinstance(item["final_amount"], (int, float))
+    assert item["final_amount"] == 75.0
     assert item["billed_amount"] == 75.0
 
 
@@ -507,6 +513,8 @@ def test_patch_line_items_success_and_get_reflects_edits(monkeypatch):
     patched_item = patch_resp.json()["line_items"][0]
     assert patched_item["qty"] == 2.0
     assert patched_item["rate"] == 150.5
+    assert isinstance(patched_item["final_amount"], (int, float))
+    assert patched_item["final_amount"] == 301.0
     assert patched_item["billed_amount"] == 301.0
     assert patched_item["amount_to_be_paid"] == 100.0
     assert FakeMongoDBClient.shared_doc["line_item_edits"][0]["edited_by"] == "qa.user"
@@ -516,6 +524,8 @@ def test_patch_line_items_success_and_get_reflects_edits(monkeypatch):
     item = get_resp.json()["line_items"][0]
     assert item["qty"] == 2.0
     assert item["rate"] == 150.5
+    assert isinstance(item["final_amount"], (int, float))
+    assert item["final_amount"] == 301.0
     assert item["billed_amount"] == 301.0
     assert item["amount_to_be_paid"] == 100.0
 
@@ -665,6 +675,8 @@ def test_get_bill_without_edits_keeps_original_values(monkeypatch):
     item = resp.json()["line_items"][0]
     assert item["qty"] is None
     assert item["rate"] is None
+    assert isinstance(item["final_amount"], (int, float))
+    assert item["final_amount"] == 80.0
     assert item["billed_amount"] == 80.0
     assert item["amount_to_be_paid"] == 80.0
 
